@@ -28,6 +28,8 @@ static struct list ready_list;
    when they are first scheduled and removed when they exit. */
 static struct list all_list;
 
+static struct list sleep_list;
+
 /* Idle thread. */
 static struct thread *idle_thread;
 
@@ -92,6 +94,7 @@ thread_init (void)
   lock_init (&tid_lock);
   list_init (&ready_list);
   list_init (&all_list);
+  list_init (&sleep_list);
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
@@ -240,6 +243,40 @@ thread_unblock (struct thread *t)
   list_push_back (&ready_list, &t->elem);
   t->status = THREAD_READY;
   intr_set_level (old_level);
+}
+
+static bool
+wakeup_tick_less (const struct list_elem *a, const struct list_elem *b,
+                  void *aux UNUSED)
+{
+  struct thread *thread_a = list_entry (a, struct thread, sleepelem);
+  struct thread *thread_b = list_entry (b, struct thread, sleepelem);
+  return thread_a->wakeup_tick < thread_b->wakeup_tick;
+}
+
+void
+thread_sleep (int64_t wakeup_tick)
+{
+  struct thread *cur_thread = thread_current ();
+  cur_thread->wakeup_tick = wakeup_tick;
+  list_insert_ordered (&sleep_list, &cur_thread->sleepelem, wakeup_tick_less,
+                       NULL);
+  thread_block ();
+}
+
+void
+thread_wakeup (int64_t now)
+{
+  struct thread *cur_thread = NULL;
+  while (!list_empty (&sleep_list))
+    {
+      cur_thread = list_entry (list_front (&sleep_list), struct thread,
+                              sleepelem);
+      if (cur_thread->wakeup_tick > now)
+        break;
+      list_pop_front (&sleep_list);
+      thread_unblock (cur_thread);
+    }
 }
 
 /* Returns the name of the running thread. */
