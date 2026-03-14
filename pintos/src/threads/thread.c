@@ -265,7 +265,7 @@ thread_sleep (int64_t wakeup_tick)
 }
 
 void
-thread_wakeup (int64_t now)
+thread_wake (int64_t now)
 {
   struct thread *cur_thread = NULL;
   while (!list_empty (&sleep_list))

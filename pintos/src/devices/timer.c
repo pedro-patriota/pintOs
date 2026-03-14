@@ -173,7 +173,7 @@ timer_interrupt (struct intr_frame *args UNUSED)
   thread_tick ();
 
   int64_t now = timer_ticks ();
-  thread_wakeup (now);
+  thread_wake (now);
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
