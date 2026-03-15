@@ -28,6 +28,8 @@ static struct list ready_list;
    when they are first scheduled and removed when they exit. */
 static struct list all_list;
 
+/* List responsible for storing threads blocked by sleep state. Threads are
+   stored in ascending order according to the tick when they should wake up. */
 static struct list sleep_list;
 
 /* Idle thread. */
