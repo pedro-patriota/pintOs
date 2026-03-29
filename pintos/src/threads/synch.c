@@ -102,7 +102,12 @@ sema_try_down (struct semaphore *sema)
 }
 
 /* Up or "V" operation on a semaphore.  Increments SEMA's value
-   and wakes up one thread of those waiting for SEMA, if any.
+   and wakes up the highest-priority thread waiting for SEMA, if
+   any.
+
+   Uses list_max() rather than list_pop_front() so that priority
+   changes caused by donation (which do not keep the waiters list
+   sorted) are always honoured.
 
    This function may be called from an interrupt handler. */
 void
@@ -113,9 +118,16 @@ sema_up (struct semaphore *sema)
   ASSERT (sema != NULL);
 
   old_level = intr_disable ();
-  if (!list_empty (&sema->waiters)) 
-    thread_unblock (list_entry (list_pop_front (&sema->waiters),
-                                struct thread, elem));
+  if (!list_empty (&sema->waiters))
+    {
+      /* Wake the highest-priority waiter.  list_max() scans the
+         entire list, so it is correct even when donations have
+         changed priorities after insertion. */
+      struct list_elem *max_elem =
+        list_max (&sema->waiters, thread_priority_less, NULL);
+      list_remove (max_elem);
+      thread_unblock (list_entry (max_elem, struct thread, elem));
+    }
   sema->value++;
   intr_set_level (old_level);
 }
@@ -156,7 +168,7 @@ sema_test_helper (void *sema_)
       sema_up (&sema[1]);
     }
 }
-
+
 /* Initializes LOCK.  A lock can be held by at most a single
    thread at any given time.  Our locks are not "recursive", that
    is, it is an error for the thread currently holding a lock to
@@ -185,6 +197,12 @@ lock_init (struct lock *lock)
    necessary.  The lock must not already be held by the current
    thread.
 
+   Implements priority donation: if the lock is already held by a
+   lower-priority thread, the current thread donates its priority
+   to that thread (and chains the donation upward through any
+   nested lock dependencies) so the holder can run and release
+   the lock sooner.
+
    This function may sleep, so it must not be called within an
    interrupt handler.  This function may be called with
    interrupts disabled, but interrupts will be turned back on if
@@ -196,8 +214,36 @@ lock_acquire (struct lock *lock)
   ASSERT (!intr_context ());
   ASSERT (!lock_held_by_current_thread (lock));
 
+  struct thread *cur = thread_current ();
+
+  if (lock->holder != NULL)
+    {
+      /* Record which lock we are waiting on so that a donor
+         that arrives later can trace the full chain. */
+      cur->waiting_on_lock = lock;
+
+      /* Walk the chain: cur → lock → holder → holder's lock → …
+         and propagate cur's effective priority upward until the
+         chain ends or the holder already has a higher priority. */
+      struct thread *holder = lock->holder;
+      while (holder != NULL && holder->priority < cur->priority)
+        {
+          holder->priority = cur->priority;
+
+          /* If this holder is itself waiting for another lock,
+             continue up the chain (nested donation). */
+          if (holder->waiting_on_lock == NULL)
+            break;
+          holder = holder->waiting_on_lock->holder;
+        }
+    }
+
   sema_down (&lock->semaphore);
-  lock->holder = thread_current ();
+
+  /* We now own the lock. */
+  cur->waiting_on_lock = NULL;
+  lock->holder = cur;
+  list_push_back (&cur->locks_held, &lock->elem);
 }
 
 /* Tries to acquires LOCK and returns true if successful or false
@@ -216,11 +262,20 @@ lock_try_acquire (struct lock *lock)
 
   success = sema_try_down (&lock->semaphore);
   if (success)
-    lock->holder = thread_current ();
+    {
+      lock->holder = thread_current ();
+      list_push_back (&thread_current ()->locks_held, &lock->elem);
+    }
   return success;
 }
 
 /* Releases LOCK, which must be owned by the current thread.
+
+   After removing the lock from the thread's held-lock list the
+   thread's effective priority is recalculated: it falls back to
+   base_priority unless another held lock still has a
+   higher-priority waiter (i.e. there is still an active
+   donation).
 
    An interrupt handler cannot acquire a lock, so it does not
    make sense to try to release a lock within an interrupt
@@ -231,8 +286,24 @@ lock_release (struct lock *lock)
   ASSERT (lock != NULL);
   ASSERT (lock_held_by_current_thread (lock));
 
+  struct thread *cur = thread_current ();
+
+  /* Remove this lock from the thread's held-lock list BEFORE
+     recalculating priority, so the recalculation does not count
+     waiters on the lock we are about to release. */
+  list_remove (&lock->elem);
   lock->holder = NULL;
+
+  /* Recalculate our effective priority now that we no longer hold
+     this lock.  If we still hold other locks with high-priority
+     waiters, the donated priority will be preserved. */
+  thread_recalculate_priority (cur);
+
+  /* Wake the highest-priority waiter (implemented in sema_up). */
   sema_up (&lock->semaphore);
+
+  /* Yield if the thread we just woke has higher priority than us. */
+  thread_yield_if_needed ();
 }
 
 /* Returns true if the current thread holds LOCK, false
@@ -245,7 +316,7 @@ lock_held_by_current_thread (const struct lock *lock)
 
   return lock->holder == thread_current ();
 }
-
+
 /* One semaphore in a list. */
 struct semaphore_elem 
   {

@@ -24,6 +24,9 @@ typedef int tid_t;
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
 
+/* Forward declaration to avoid circular dependency with synch.h. */
+struct lock;
+
 /* A kernel thread or user process.
 
    Each thread structure is stored in its own 4 kB page.  The
@@ -87,7 +90,10 @@ struct thread
     enum thread_status status;          /* Thread state. */
     char name[16];                      /* Name (for debugging purposes). */
     uint8_t *stack;                     /* Saved stack pointer. */
-    int priority;                       /* Priority. */
+    int priority;                       /* Effective priority (may be donated). */
+    int base_priority;                  /* Original priority before any donation. */
+    struct list locks_held;             /* Locks currently held by this thread. */
+    struct lock *waiting_on_lock;       /* Lock this thread is blocked waiting for. */
     struct list_elem allelem;           /* List element for all threads list. */
 
     int64_t wakeup_tick;
@@ -138,6 +144,13 @@ void thread_foreach (thread_action_func *, void *);
 
 int thread_get_priority (void);
 void thread_set_priority (int);
+
+/* Priority donation helpers — used by synch.c. */
+bool thread_priority_less (const struct list_elem *a,
+                           const struct list_elem *b,
+                           void *aux);
+void thread_recalculate_priority (struct thread *t);
+void thread_yield_if_needed (void);
 
 int thread_get_nice (void);
 void thread_set_nice (int);
