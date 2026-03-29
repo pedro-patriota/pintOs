@@ -75,6 +75,71 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
+int
+priority_array_front(struct priority_array *arr)
+{
+  ASSERT (arr != NULL);
+  ASSERT (arr->size > 0);
+  return arr->data[0];
+}
+
+int
+priority_array_back(struct priority_array *arr)
+{
+  ASSERT (arr != NULL);
+  ASSERT (arr->size > 0);
+  return arr->data[arr->size - 1];
+}
+
+bool
+priority_array_push(struct priority_array *arr, int priority)
+{
+  ASSERT (arr != NULL);
+  if (arr->size == (sizeof(arr->data) / sizeof(arr->data[0])))
+    return false;
+  arr->data[arr->size] = priority;
+  ++arr->size;
+  return true;
+}
+
+bool
+priority_array_pop(struct priority_array *arr)
+{
+  ASSERT (arr != NULL);
+  if (arr->size == 0)
+    return false;
+  --arr->size;
+  return true;
+}
+
+bool
+priority_array_remove (struct priority_array *arr, int priority)
+{
+  bool found = false;
+  size_t idx = 0;
+
+  ASSERT (arr != NULL);
+
+  for (size_t i = 0; (i < arr->size) && !found; ++i)
+    {
+      if (arr->data[i] == priority)
+        {
+          found = true;
+          idx = i;
+        }
+    }
+
+  if (found)
+    {
+      if (idx < arr->size - 1)
+        memmove(arr->data + idx, arr->data + idx + 1,
+                (arr->size - 1 - idx) * sizeof(arr->data[0]));
+      --arr->size;
+    }
+
+  return found;
+}
+
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
    general and it is possible in this case only because loader.S
@@ -205,6 +270,7 @@ thread_create (const char *name, int priority,
 
   /* Add to run queue. */
   thread_unblock (t);
+  thread_yield ();
 
   return tid;
 }
@@ -225,6 +291,15 @@ thread_block (void)
   schedule ();
 }
 
+bool
+thread_priority_greater (const struct list_elem *a, const struct list_elem *b,
+                         void *aux UNUSED)
+{
+  struct thread *thread_a = list_entry (a, struct thread, elem);
+  struct thread *thread_b = list_entry (b, struct thread, elem);
+  return thread_a->priority > thread_b->priority;
+}
+
 /* Transitions a blocked thread T to the ready-to-run state.
    This is an error if T is not blocked.  (Use thread_yield() to
    make the running thread ready.)
@@ -242,17 +317,21 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  list_insert_ordered (&ready_list, &t->elem, thread_priority_greater, NULL);
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
 
 static bool
-wakeup_tick_less (const struct list_elem *a, const struct list_elem *b,
-                  void *aux UNUSED)
+thread_wakeup_tick_less (const struct list_elem *a, const struct list_elem *b,
+                         void *aux UNUSED)
 {
   struct thread *thread_a = list_entry (a, struct thread, sleepelem);
   struct thread *thread_b = list_entry (b, struct thread, sleepelem);
+
+  if (thread_a->wakeup_tick == thread_b->wakeup_tick)
+    return thread_a->priority > thread_b->priority;
+
   return thread_a->wakeup_tick < thread_b->wakeup_tick;
 }
 
@@ -261,8 +340,8 @@ thread_sleep (int64_t wakeup_tick)
 {
   struct thread *cur_thread = thread_current ();
   cur_thread->wakeup_tick = wakeup_tick;
-  list_insert_ordered (&sleep_list, &cur_thread->sleepelem, wakeup_tick_less,
-                       NULL);
+  list_insert_ordered (&sleep_list, &cur_thread->sleepelem,
+                       thread_wakeup_tick_less, NULL);
   thread_block ();
 }
 
@@ -273,7 +352,7 @@ thread_wake (int64_t now)
   while (!list_empty (&sleep_list))
     {
       cur_thread = list_entry (list_front (&sleep_list), struct thread,
-                              sleepelem);
+                               sleepelem);
       if (cur_thread->wakeup_tick > now)
         break;
       list_pop_front (&sleep_list);
@@ -347,7 +426,8 @@ thread_yield (void)
 
   old_level = intr_disable ();
   if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+    list_insert_ordered (&ready_list, &cur->elem, thread_priority_greater,
+                         NULL);
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -374,7 +454,14 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
-  thread_current ()->priority = new_priority;
+  struct thread *cur_thread = thread_current ();
+
+  cur_thread->priorities.data[0] = new_priority;
+  if (cur_thread->priorities.size == 1)
+    {
+      cur_thread->priority = new_priority;
+      thread_yield ();
+    }
 }
 
 /* Returns the current thread's priority. */
@@ -415,6 +502,12 @@ thread_get_recent_cpu (void)
   return 0;
 }
 
+void
+thread_sort_ready_list(void)
+{
+  list_sort(&ready_list, thread_priority_greater, NULL);
+}
+
 /* Idle thread.  Executes when no other thread is ready to run.
 
    The idle thread is initially put on the ready list by
@@ -501,6 +594,10 @@ init_thread (struct thread *t, const char *name, int priority)
   strlcpy (t->name, name, sizeof t->name);
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
+  t->priorities.data[0] = priority;
+  t->priorities.size = 1;
+  t->donation_no = 0;
+  t->waiting_lock = NULL;
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();

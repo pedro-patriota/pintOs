@@ -24,6 +24,24 @@ typedef int tid_t;
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
 
+#define PRI_SIZE_MAX 9                  /* 1 (base priority) + NESTING_DEPTH */
+
+struct priority_array
+{
+  int data[PRI_SIZE_MAX];
+  size_t size;
+};
+
+int priority_array_front (struct priority_array *arr);
+int priority_array_back (struct priority_array *arr);
+
+bool priority_array_push (struct priority_array *arr, int priority);
+bool priority_array_pop (struct priority_array *arr);
+
+bool priority_array_remove (struct priority_array *arr, int priority);
+
+struct lock;
+
 /* A kernel thread or user process.
 
    Each thread structure is stored in its own 4 kB page.  The
@@ -90,11 +108,15 @@ struct thread
     int priority;                       /* Priority. */
     struct list_elem allelem;           /* List element for all threads list. */
 
+    /* Shared between thread.c and synch.c. */
+    struct list_elem elem;              /* List element. */
+
     int64_t wakeup_tick;
     struct list_elem sleepelem;
 
-    /* Shared between thread.c and synch.c. */
-    struct list_elem elem;              /* List element. */
+    struct priority_array priorities;
+    int donation_no;
+    struct lock *waiting_lock;
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
@@ -120,6 +142,8 @@ typedef void thread_func (void *aux);
 tid_t thread_create (const char *name, int priority, thread_func *, void *);
 
 void thread_block (void);
+bool thread_priority_greater (const struct list_elem *a,
+                              const struct list_elem *b, void *aux UNUSED);
 void thread_unblock (struct thread *);
 
 void thread_sleep (int64_t wakeup_tick);
@@ -138,10 +162,13 @@ void thread_foreach (thread_action_func *, void *);
 
 int thread_get_priority (void);
 void thread_set_priority (int);
+bool thread_remove_priority (struct thread *t, int priority);
 
 int thread_get_nice (void);
 void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
+
+void thread_sort_ready_list(void);
 
 #endif /* threads/thread.h */
