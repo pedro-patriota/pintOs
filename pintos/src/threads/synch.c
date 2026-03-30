@@ -222,25 +222,23 @@ lock_acquire (struct lock *lock)
 
   struct thread *cur = thread_current ();
 
+  // doa prioridade antes de bloquear, em cadeia
+
   if (lock->holder != NULL)
     {
-      /* Record which lock we are waiting on so that a donor
-         that arrives later can trace the full chain. */
+      // registra a espera
       cur->waiting_on_lock = lock;
 
-      /* Walk the chain: cur → lock → holder → holder's lock → …
-         and propagate cur's effective priority upward until the
-         chain ends or the holder already has a higher priority. */
+      /* sobe as prioridades por nível considerando a cadeia de dependâNcia de lock */
       struct thread *holder = lock->holder;
       while (holder != NULL && holder->priority < cur->priority)
         {
-          holder->priority = cur->priority;
+          holder->priority = cur->priority; // dua
 
-          /* If this holder is itself waiting for another lock,
-             continue up the chain (nested donation). */
+
           if (holder->waiting_on_lock == NULL)
             break;
-          holder = holder->waiting_on_lock->holder;
+          holder = holder->waiting_on_lock->holder; // sobe o nível da cadeia
         }
     }
 
@@ -294,22 +292,14 @@ lock_release (struct lock *lock)
 
   struct thread *cur = thread_current ();
 
-  /* Remove this lock from the thread's held-lock list BEFORE
-     recalculating priority, so the recalculation does not count
-     waiters on the lock we are about to release. */
-  list_remove (&lock->elem);
+  list_remove (&lock->elem); // remove da lista de locks holders
   lock->holder = NULL;
 
-  /* Recalculate our effective priority now that we no longer hold
-     this lock.  If we still hold other locks with high-priority
-     waiters, the donated priority will be preserved. */
-  thread_recalculate_priority (cur);
+  thread_recalculate_priority (cur); // recalcula pois pode ter alguma doação ainda ativa
 
-  /* Wake the highest-priority waiter (implemented in sema_up). */
-  sema_up (&lock->semaphore);
+  sema_up (&lock->semaphore); // acorda waiter de maior prioridade
 
-  /* Yield if the thread we just woke has higher priority than us. */
-  thread_yield_if_needed ();
+  thread_yield_if_needed (); // cde a cpu se o elemento acordado for mais prioritário
 }
 
 /* Returns true if the current thread holds LOCK, false
