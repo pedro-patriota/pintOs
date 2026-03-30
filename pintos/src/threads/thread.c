@@ -121,17 +121,14 @@ thread_recalculate_priority (struct thread *t)
 
 /* Sem isso, uma thread que acabou de liberar um lock de alta prioridade 
 continuaria rodando mesmo com uma thread de prioridade maior esperando na fila*/
-void
-thread_yield_if_needed (void)
+void thread_yield_if_needed (void)
 {
-  if (list_empty (&ready_list))
+  if (list_empty(&ready_list))
     return;
 
-  struct thread *next =
-    list_entry (list_max (&ready_list, thread_priority_less, NULL),
-                struct thread, elem);
+  struct thread *next = list_entry(list_max (&ready_list, thread_priority_less, NULL), struct thread, elem);
 
-  if (next->priority > thread_current ()->priority)
+  if(next->priority > thread_current ()->priority)
     thread_yield (); // cede cpu para quem tem maior prioridade
 }
 
@@ -270,8 +267,7 @@ thread_create (const char *name, int priority,
   /* Add to run queue. */
   thread_unblock (t);
 
-  /* If the newly created thread has higher priority than the current
-     thread, yield immediately so the scheduler can run it. */
+  // se a thread mais nova criada tem uma maior prioridade do que a thread corrente, executa o yield
   if (t->priority > thread_current ()->priority)
     thread_yield ();
 
@@ -443,8 +439,7 @@ thread_foreach (thread_action_func *func, void *aux)
    If the thread currently benefits from a donation that is higher
    than NEW_PRIORITY, the donated priority is kept.  Yields the CPU
    if a ready thread now has higher effective priority. */
-void
-thread_set_priority (int new_priority) 
+void thread_set_priority (int new_priority) 
 {
   // altera base, mantém doação se ativa 
   struct thread *cur = thread_current ();
@@ -608,8 +603,7 @@ alloc_frame (struct thread *t, size_t size)
 
    Uses list_max() so priorities that change due to donation are
    always respected, regardless of insertion order. */
-static struct thread *
-next_thread_to_run (void) 
+static struct thread *next_thread_to_run (void) 
 {
   if (list_empty (&ready_list))
     return idle_thread;
