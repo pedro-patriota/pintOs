@@ -79,9 +79,7 @@ static tid_t allocate_tid (void);
    Priority helpers
    ----------------------------------------------------------------------- */
 
-/* Returns true if thread A has strictly lower priority than thread B.
-   Used with list_max() to find the highest-priority element, and with
-   list_insert_ordered() to build ascending-order lists. */
+/*retorna 'True' se A é menor do que B. faz a comparação de prioridade entre suas estruturas de threads  */
 bool
 thread_priority_less (const struct list_elem *a,
                       const struct list_elem *b,
@@ -91,19 +89,16 @@ thread_priority_less (const struct list_elem *a,
        < list_entry (b, struct thread, elem)->priority;
 }
 
-/* Recalculates T's effective priority as the maximum of its own
-   base_priority and the effective priority of the highest-priority
-   thread waiting on any lock that T currently holds.
-
-   Called after T acquires a lock (to account for existing waiters)
-   and after T releases a lock (to drop any donated priority that is
-   no longer needed). */
+/* A lógica é recalcular a prioridade efetiva entre a máxima priodidade de base 
+e a maior prioridade de qualquer thread esperando algum lock que está sendo segurado.
+Caso contrário, segura mais nenhum lock com espera e volta ao base_priority*/
 void
 thread_recalculate_priority (struct thread *t)
 {
   int priority = t->base_priority;
   struct list_elem *e;
-
+  
+  //percorre cada lock que a thread ainda segura
   for (e = list_begin (&t->locks_held);
        e != list_end (&t->locks_held);
        e = list_next (e))
@@ -111,22 +106,21 @@ thread_recalculate_priority (struct thread *t)
       struct lock *l = list_entry (e, struct lock, elem);
       if (!list_empty (&l->semaphore.waiters))
         {
-          /* Find the highest-priority thread waiting on this lock. */
+          /* encontra o waiter de maior prioridade neste lock*/
           int waiter_pri =
             list_entry (list_max (&l->semaphore.waiters,
                                   thread_priority_less, NULL),
                         struct thread, elem)->priority;
           if (waiter_pri > priority)
-            priority = waiter_pri;
+            priority = waiter_pri; // mantém a doação se necessário
         }
     }
 
   t->priority = priority;
 }
 
-/* Yields the CPU to the highest-priority ready thread if it has
-   strictly greater priority than the current thread.  Must not be
-   called from an interrupt context. */
+/* Sem isso, uma thread que acabou de liberar um lock de alta prioridade 
+continuaria rodando mesmo com uma thread de prioridade maior esperando na fila*/
 void
 thread_yield_if_needed (void)
 {
@@ -138,7 +132,7 @@ thread_yield_if_needed (void)
                 struct thread, elem);
 
   if (next->priority > thread_current ()->priority)
-    thread_yield ();
+    thread_yield (); // cede cpu para quem tem maior prioridade
 }
 
 /* -----------------------------------------------------------------------
@@ -452,10 +446,11 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
+  // altera base, mantém doação se ativa 
   struct thread *cur = thread_current ();
   cur->base_priority = new_priority;
   thread_recalculate_priority (cur);
-  thread_yield_if_needed ();
+  thread_yield_if_needed (); 
 }
 
 /* Returns the current thread's effective priority. */
@@ -582,9 +577,9 @@ init_thread (struct thread *t, const char *name, int priority)
   strlcpy (t->name, name, sizeof t->name);
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
-  t->base_priority = priority;       /* NEW: initialise base priority. */
-  list_init (&t->locks_held);        /* NEW: no locks held yet. */
-  t->waiting_on_lock = NULL;         /* NEW: not waiting on any lock. */
+  t->base_priority = priority;       // base de início
+  list_init (&t->locks_held);        // lista de locks vazias
+  t->waiting_on_lock = NULL;         // setado como NULL: não espera nenhum lock
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();
@@ -618,9 +613,9 @@ next_thread_to_run (void)
 {
   if (list_empty (&ready_list))
     return idle_thread;
-
-  struct list_elem *max_elem =
-    list_max (&ready_list, thread_priority_less, NULL);
+  // pega o de maior prioridade, onde quer que esteja na lista
+  // utilizar list_max por conta da mudança de prioridade causada por prioridades de threads que já estão na ready_list
+  struct list_elem *max_elem = list_max (&ready_list, thread_priority_less, NULL);
   list_remove (max_elem);
   return list_entry (max_elem, struct thread, elem);
 }
