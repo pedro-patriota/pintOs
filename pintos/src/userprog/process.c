@@ -515,6 +515,12 @@ setup_stack (void **esp, const char *cmd_line)
           *esp -= sizeof (void *);
           *(void **)*esp = NULL;
 
+#if 0
+          /* Print the stack. Make sure to keep this DISABLED during tests. */
+          hex_dump ((uintptr_t) *esp, *esp,
+                    (uintptr_t) PHYS_BASE - (uintptr_t) *esp, true);
+#endif
+
           palloc_free_page (cmd_copy);
         }
       else
