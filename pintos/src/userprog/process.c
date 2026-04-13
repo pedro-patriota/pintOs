@@ -21,13 +21,6 @@
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 
-static char *
-extract_prog_name (const char *file_name)
-{
-  char *save_ptr;
-  return strtok_r ((char *) file_name, " ", &save_ptr);
-}
-
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
@@ -36,7 +29,10 @@ tid_t
 process_execute (const char *file_name)
 {
   char *fn_copy;
+  char *prog_name_copy;
   tid_t tid;
+  char *prog_name;
+  char *save_ptr;
 
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
@@ -45,10 +41,18 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
-  char *prog_name = extract_prog_name (file_name);
+  prog_name_copy = palloc_get_page (0);
+  if (prog_name_copy == NULL)
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+  strlcpy (prog_name_copy, file_name, PGSIZE);
+  prog_name = strtok_r (prog_name_copy, " ", &save_ptr);
 
   /* Create a new thread to execute FILE_NAME. */
   tid = thread_create (prog_name, PRI_DEFAULT, start_process, fn_copy);
+  palloc_free_page (prog_name_copy);
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy);
   return tid;
@@ -97,9 +101,9 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED)
 {
-  /* Temporary implementation: busy-wait so the parent doesn't
-     exit before the child finishes. Will be replaced with
-     proper synchronization in Project 2-2 (syscalls). */
+  /* Temporary implementation: keep the initial process alive
+     long enough for the child to run, until parent/child
+     synchronization is implemented properly. */
   volatile int i;
   for (i = 0; i < 300000000; i++)
     ;
@@ -229,13 +233,20 @@ load (const char *file_name, void (**eip) (void), void **esp)
   off_t file_ofs;
   bool success = false;
   int i;
+  char *prog_name_copy = NULL;
+  char *prog_name;
+  char *save_ptr;
 
   char *cmd_line_copy = palloc_get_page (0);
   if (cmd_line_copy == NULL)
     return false;
   strlcpy (cmd_line_copy, file_name, PGSIZE);
 
-  char *prog_name = extract_prog_name (file_name);
+  prog_name_copy = palloc_get_page (0);
+  if (prog_name_copy == NULL)
+    goto done;
+  strlcpy (prog_name_copy, file_name, PGSIZE);
+  prog_name = strtok_r (prog_name_copy, " ", &save_ptr);
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
@@ -334,6 +345,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
+  palloc_free_page (prog_name_copy);
   palloc_free_page (cmd_line_copy);
   file_close (file);
   return success;
