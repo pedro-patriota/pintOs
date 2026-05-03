@@ -156,6 +156,16 @@ pagedir_clear_page (uint32_t *pd, void *upage)
     }
 }
 
+/* Returns true if the PTE for user virtual address UPAGE in PD is
+   present and writable.  Returns false if UPAGE is unmapped or
+   read-only. */
+bool
+pagedir_is_writable (uint32_t *pd, const void *upage)
+{
+  uint32_t *pte = lookup_page (pd, upage, false);
+  return pte != NULL && (*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W);
+}
+
 /* Returns true if the PTE for virtual page VPAGE in PD is dirty,
    that is, if the page has been modified since the PTE was
    installed.

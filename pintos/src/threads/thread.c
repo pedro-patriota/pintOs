@@ -583,6 +583,14 @@ init_thread (struct thread *t, const char *name, int priority)
   t->base_priority = priority;       // base de início
   list_init (&t->locks_held);        // lista de locks vazias
   t->waiting_on_lock = NULL;         // setado como NULL: não espera nenhum lock
+#ifdef USERPROG
+  t->pagedir = NULL;
+  list_init (&t->children);
+  t->child_record = NULL;
+  t->exit_status = -1;
+  t->next_fd = 2;
+  t->executable = NULL;
+#endif
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();

@@ -4,6 +4,9 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#ifdef USERPROG
+#include "threads/synch.h"
+#endif
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -26,6 +29,23 @@ typedef int tid_t;
 
 /* Forward declaration to avoid circular dependency with synch.h. */
 struct lock;
+struct file;
+
+#ifdef USERPROG
+#define MAX_FD 128
+
+struct child_process
+  {
+    tid_t tid;
+    int exit_status;
+    bool load_success;
+    bool waited;
+    int ref_cnt;
+    struct semaphore load_sema;
+    struct semaphore exit_sema;
+    struct list_elem elem;
+  };
+#endif
 
 /* A kernel thread or user process.
 
@@ -105,6 +125,12 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    struct list children;               /* Child process records. */
+    struct child_process *child_record; /* Record shared with parent. */
+    int exit_status;                    /* Status reported to parent. */
+    struct file *fd_table[MAX_FD];      /* Open files by descriptor. */
+    int next_fd;                        /* Next descriptor search point. */
+    struct file *executable;            /* Running executable. */
 #endif
 
     /* Owned by thread.c. */
