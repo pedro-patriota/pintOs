@@ -1,5 +1,6 @@
 #include "userprog/exception.h"
 #include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include "userprog/gdt.h"
 #include "userprog/process.h"
@@ -147,11 +148,6 @@ page_fault (struct intr_frame *f)
      be assured of reading CR2 before it changed). */
   intr_enable ();
 
-#ifdef VM
-  if (!handle_page_fault (fault_addr, f))
-    kill (f);
-#endif
-
   /* Count page faults. */
   page_fault_cnt++;
 
@@ -159,6 +155,11 @@ page_fault (struct intr_frame *f)
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
+
+#ifdef VM
+  if (handle_page_fault (fault_addr, f))
+    return;
+#endif
 
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to
@@ -206,6 +207,6 @@ handle_page_fault (void *fault_addr, struct intr_frame *f)
 static bool
 should_grow_stack (void *fault_addr, void *esp)
 {
-  return esp - 32 <= fault_addr && fault_addr < PHYS_BASE;
+  return (uint8_t *)esp - 32 <= (uint8_t *)fault_addr && fault_addr < PHYS_BASE;
 }
 #endif

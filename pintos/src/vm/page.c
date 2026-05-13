@@ -28,18 +28,20 @@ install_page (void *user_vaddr, void *kernel_vaddr, bool is_writable)
 static unsigned
 sup_page_table_hash_func (const struct hash_elem *elem, void *aux UNUSED)
 {
-  const struct frame *f = hash_entry (elem, struct sup_page_entry, elem);
-  return hash_bytes (&f->kernel_vaddr, sizeof (f->kernel_vaddr));
+  struct sup_page_entry *spe =
+      hash_entry (elem, struct sup_page_entry, elem);
+  return hash_bytes (&spe->user_vaddr, sizeof (spe->user_vaddr));
 }
 
 static bool
-sup_page_table_less_func (const struct hash_elem *a,
-                          const struct hash_elem *b,
+sup_page_table_less_func (const struct hash_elem *a, const struct hash_elem *b,
                           void *aux UNUSED)
 {
-  const struct frame *fa = hash_entry (a, struct sup_page_entry, elem);
-  const struct frame *fb = hash_entry (b, struct sup_page_entry, elem);
-  return fa->kernel_vaddr < fb->kernel_vaddr;
+  struct sup_page_entry *spe_a =
+      hash_entry (a, struct sup_page_entry, elem);
+  struct sup_page_entry *spe_b =
+      hash_entry (b, struct sup_page_entry, elem);
+  return spe_a->user_vaddr < spe_b->user_vaddr;
 }
 
 void
@@ -78,39 +80,50 @@ sup_page_table_lookup (struct sup_page_table *table, void *user_vaddr)
   key.user_vaddr = pg_round_down (user_vaddr);
   e = hash_find (&table->table, &key.elem);
 
-  if (e != NULL)
-    e = hash_entry (e, struct sup_page_entry, elem);
+  if (e == NULL)
+    return NULL;
 
-  return e;
+  return hash_entry (e, struct sup_page_entry, elem);
 }
 
 bool
-load_page(struct sup_page_entry *spe)
+load_page (struct sup_page_entry *spe)
 {
-  void *kernel_vaddr = frame_alloc (spe->user_vaddr);
-  off_t file_size = 0;
+  void *kernel_vaddr = NULL;
+  size_t file_size = 0;
   bool ok = true;
+
+  kernel_vaddr = frame_alloc (spe->user_vaddr);
+  if (kernel_vaddr == NULL)
+    {
+      ok = false;
+      goto CLEANUP;
+    }
 
   if (spe->file != NULL)
     {
       file_seek (spe->file, spe->offset);
 
-      file_size = file_read (spe->file, kernel_vaddr, spe->read_bytes);
+      file_size = (size_t)file_read (spe->file, kernel_vaddr, spe->read_bytes);
 
-      if ((size_t)file_size != spe->read_bytes)
+      if (file_size != spe->read_bytes)
         {
           ok = false;
           goto CLEANUP;
         }
 
-      memset (kernel_vaddr + spe->read_bytes, 0, spe->zero_bytes);
+      memset ((uint8_t *) kernel_vaddr + spe->read_bytes, 0, spe->zero_bytes);
     }
+  else
+    memset(kernel_vaddr, 0, PGSIZE);
 
   if (!install_page (spe->user_vaddr, kernel_vaddr,
                      spe->flags & SUP_PAGE_WRITABLE))
     ok = false;
 
 CLEANUP:
-  palloc_free_page (kernel_vaddr);
+  if (!ok && kernel_vaddr != NULL)
+    frame_free (kernel_vaddr);
+
   return ok;
 }
