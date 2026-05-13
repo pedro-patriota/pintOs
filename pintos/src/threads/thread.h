@@ -7,6 +7,9 @@
 #ifdef USERPROG
 #include "threads/synch.h"
 #endif
+#ifdef VM
+#include "vm/page.h"
+#endif
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -131,6 +134,10 @@ struct thread
     struct file *fd_table[MAX_FD];      /* Open files by descriptor. */
     int next_fd;                        /* Next descriptor search point. */
     struct file *executable;            /* Running executable. */
+#endif
+
+#ifdef VM
+    struct sup_page_table spt;
 #endif
 
     /* Owned by thread.c. */

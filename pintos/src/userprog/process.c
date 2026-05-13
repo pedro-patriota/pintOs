@@ -149,6 +149,10 @@ start_process (void *file_name_)
   struct intr_frame if_;
   bool success;
 
+#ifdef VM
+  sup_page_table_init (&thread_current ()->spt);
+#endif
+
   thread_current ()->child_record = child;
   free (args);
 

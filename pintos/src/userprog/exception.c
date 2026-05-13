@@ -5,12 +5,21 @@
 #include "userprog/process.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#ifdef VM
+#include <stdlib.h>
+#include "threads/vaddr.h"
+#include "vm/page.h"
+#endif
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
 
 static void kill (struct intr_frame *);
 static void page_fault (struct intr_frame *);
+#ifdef VM
+static bool handle_page_fault (void *fault_addr, struct intr_frame *f);
+static bool should_grow_stack (void *fault_addr, void *esp);
+#endif
 
 /* Registers handlers for interrupts that can be caused by user
    programs.
@@ -28,7 +37,7 @@ static void page_fault (struct intr_frame *);
    Refer to [IA32-v3a] section 5.15 "Exception and Interrupt
    Reference" for a description of each of these exceptions. */
 void
-exception_init (void) 
+exception_init (void)
 {
   /* These exceptions can be raised explicitly by a user program,
      e.g. via the INT, INT3, INTO, and BOUND instructions.  Thus,
@@ -63,14 +72,14 @@ exception_init (void)
 
 /* Prints exception statistics. */
 void
-exception_print_stats (void) 
+exception_print_stats (void)
 {
   printf ("Exception: %lld page faults\n", page_fault_cnt);
 }
 
 /* Handler for an exception (probably) caused by a user process. */
 static void
-kill (struct intr_frame *f) 
+kill (struct intr_frame *f)
 {
   /* This interrupt is one (probably) caused by a user process.
      For example, the process might have tried to access unmapped
@@ -79,7 +88,7 @@ kill (struct intr_frame *f)
      the kernel.  Real Unix-like operating systems pass most
      exceptions back to the process via signals, but we don't
      implement them. */
-     
+
   /* The interrupt frame's code segment value tells us where the
      exception originated. */
   switch (f->cs)
@@ -95,7 +104,7 @@ kill (struct intr_frame *f)
          may cause kernel exceptions--but they shouldn't arrive
          here.)  Panic the kernel to make the point.  */
       intr_dump_frame (f);
-      PANIC ("Kernel bug - unexpected interrupt in kernel"); 
+      PANIC ("Kernel bug - unexpected interrupt in kernel");
 
     default:
       /* Some other code segment?  Shouldn't happen.  Panic the
@@ -118,7 +127,7 @@ kill (struct intr_frame *f)
    description of "Interrupt 14--Page Fault Exception (#PF)" in
    [IA32-v3a] section 5.15 "Exception and Interrupt Reference". */
 static void
-page_fault (struct intr_frame *f) 
+page_fault (struct intr_frame *f)
 {
   bool not_present;  /* True: not-present page, false: writing r/o page. */
   bool write;        /* True: access was write, false: access was read. */
@@ -137,6 +146,11 @@ page_fault (struct intr_frame *f)
   /* Turn interrupts back on (they were only off so that we could
      be assured of reading CR2 before it changed). */
   intr_enable ();
+
+#ifdef VM
+  if (!handle_page_fault (fault_addr, f))
+    kill (f);
+#endif
 
   /* Count page faults. */
   page_fault_cnt++;
@@ -159,3 +173,39 @@ page_fault (struct intr_frame *f)
           "kernel");
   kill (f);
 }
+
+#ifdef VM
+static bool
+handle_page_fault (void *fault_addr, struct intr_frame *f)
+{
+  struct thread *t = thread_current ();
+  void *user_vaddr = pg_round_down (fault_addr);
+  struct sup_page_entry *spe = NULL;
+
+  if (fault_addr >= PHYS_BASE)
+    return false;
+
+  spe = sup_page_table_lookup(&t->spt, user_vaddr);
+
+  if (spe == NULL)
+    {
+      if (!should_grow_stack(fault_addr, f->esp))
+        return false;
+
+      spe = calloc(1, sizeof (struct sup_page_entry));
+
+      spe->user_vaddr = user_vaddr;
+      spe->flags |= SUP_PAGE_WRITABLE;
+
+      sup_page_table_insert(&t->spt, spe);
+    }
+
+  return load_page(spe);
+}
+
+static bool
+should_grow_stack (void *fault_addr, void *esp)
+{
+  return esp - 32 <= fault_addr && fault_addr < PHYS_BASE;
+}
+#endif
