@@ -383,6 +383,11 @@ static bool validate_segment (const struct Elf32_Phdr *, struct file *);
 static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
                           uint32_t read_bytes, uint32_t zero_bytes,
                           bool writable);
+static bool push_stack_args (void **esp, const char *cmd_line);
+static bool stack_page_alloc (void *upage, uint8_t **kpage);
+static void stack_page_free (void *kpage);
+static void stack_page_loaded (void *kpage);
+static void stack_page_remove_spt_entry (void *upage);
 
 /* Loads an ELF executable from FILE_NAME into the current thread.
    Stores the executable's entry point into *EIP
@@ -501,6 +506,12 @@ load (const char *file_name, void (**eip) (void), void **esp)
         }
     }
 
+#ifdef VM
+  file_deny_write (file);
+  syscall_filesys_lock_release ();
+  filesys_locked = false;
+#endif
+
   /* Set up stack. */
   if (!setup_stack (esp, cmd_line_copy))
     goto done;
@@ -508,7 +519,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
 
+#ifndef VM
   file_deny_write (file);
+#endif
   t->executable = file;
   file = NULL;
   success = true;
@@ -517,6 +530,12 @@ load (const char *file_name, void (**eip) (void), void **esp)
   /* We arrive here whether the load is successful or not. */
   if (filesys_locked)
     {
+      file_close (file);
+      syscall_filesys_lock_release ();
+    }
+  else if (file != NULL)
+    {
+      syscall_filesys_lock_acquire ();
       file_close (file);
       syscall_filesys_lock_release ();
     }
@@ -598,11 +617,9 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
+#ifdef VM
   while (read_bytes > 0 || zero_bytes > 0)
     {
-      /* Calculate how to fill this page.
-         We will read PAGE_READ_BYTES bytes from FILE
-         and zero the final PAGE_ZERO_BYTES bytes. */
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
@@ -611,12 +628,40 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
                                     SUP_PAGE_FILE))
         return false;
 
-      /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
       upage += PGSIZE;
       ofs += PGSIZE;
     }
+#else
+  file_seek (file, ofs);
+  while (read_bytes > 0 || zero_bytes > 0)
+    {
+      size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
+      size_t page_zero_bytes = PGSIZE - page_read_bytes;
+      uint8_t *kpage = palloc_get_page (PAL_USER);
+
+      if (kpage == NULL)
+        return false;
+
+      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
+        {
+          palloc_free_page (kpage);
+          return false;
+        }
+      memset (kpage + page_read_bytes, 0, page_zero_bytes);
+
+      if (!install_page (upage, kpage, writable))
+        {
+          palloc_free_page (kpage);
+          return false;
+        }
+
+      read_bytes -= page_read_bytes;
+      zero_bytes -= page_zero_bytes;
+      upage += PGSIZE;
+    }
+#endif
   return true;
 }
 
@@ -630,95 +675,145 @@ setup_stack (void **esp, const char *cmd_line)
   void *upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
   bool success = false;
 
+  if (!stack_page_alloc (upage, &kpage))
+    return false;
+
+  success = install_page (upage, kpage, true);
+  if (success)
+    {
+      *esp = PHYS_BASE;
+      success = push_stack_args (esp, cmd_line);
+      if (!success)
+        {
+          pagedir_clear_page (thread_current ()->pagedir, upage);
+          stack_page_free (kpage);
+          goto cleanup;
+        }
+      stack_page_loaded (kpage);
+    }
+  else
+    stack_page_free (kpage);
+
+cleanup:
+  if (!success)
+    stack_page_remove_spt_entry (upage);
+  return success;
+}
+
+static bool
+stack_page_alloc (void *upage, uint8_t **kpage)
+{
+#ifdef VM
   if (!sup_page_table_add_anon (&thread_current ()->spt, upage, true))
     return false;
 
-  kpage = frame_alloc (upage);
-  if (kpage != NULL)
+  *kpage = frame_alloc (upage);
+  if (*kpage != NULL)
+    memset (*kpage, 0, PGSIZE);
+#else
+  (void) upage;
+  *kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+#endif
+  return *kpage != NULL;
+}
+
+static void
+stack_page_free (void *kpage)
+{
+#ifdef VM
+  frame_free (kpage);
+#else
+  palloc_free_page (kpage);
+#endif
+}
+
+static void
+stack_page_loaded (void *kpage)
+{
+#ifdef VM
+  frame_unpin (kpage);
+#else
+  (void) kpage;
+#endif
+}
+
+static void
+stack_page_remove_spt_entry (void *upage)
+{
+#ifdef VM
+  struct sup_page_entry *spe =
+    sup_page_table_lookup (&thread_current ()->spt, upage);
+  if (spe != NULL)
+    sup_page_table_remove (&thread_current ()->spt, spe);
+#else
+  (void) upage;
+#endif
+}
+
+static bool
+push_stack_args (void **esp, const char *cmd_line)
+{
+  char *cmd_copy;
+  char *token, *save_ptr;
+  char *argv[128];
+  char *argv_addrs[128];
+  char **argv_start;
+  int argc = 0;
+  int i;
+
+  cmd_copy = palloc_get_page (0);
+  if (cmd_copy == NULL)
+    return false;
+  strlcpy (cmd_copy, cmd_line, PGSIZE);
+
+  for (token = strtok_r (cmd_copy, " ", &save_ptr); token != NULL;
+       token = strtok_r (NULL, " ", &save_ptr))
+    argv[argc++] = token;
+
+  /* Push argument strings onto the stack (right to left). */
+  for (i = argc - 1; i >= 0; i--)
     {
-      memset (kpage, 0, PGSIZE);
-      success = install_page (upage, kpage, true);
-      if (success)
-        {
-          *esp = PHYS_BASE;
+      size_t len = strlen (argv[i]) + 1;
+      *esp -= len;
+      memcpy (*esp, argv[i], len);
+      argv_addrs[i] = *esp;
+    }
 
-          /* Tokenize the command line and collect arguments. */
-          char *token, *save_ptr;
-          int argc = 0;
-          char *argv[128];
-          char *cmd_copy = palloc_get_page (0);
-          if (cmd_copy == NULL)
-            {
-              pagedir_clear_page (thread_current ()->pagedir, upage);
-              frame_free (kpage);
-              success = false;
-              goto cleanup;
-            }
-          strlcpy (cmd_copy, cmd_line, PGSIZE);
+  /* Word-align. */
+  *esp = (void *)((uintptr_t) *esp & ~3);
 
-          for (token = strtok_r (cmd_copy, " ", &save_ptr); token != NULL;
-               token = strtok_r (NULL, " ", &save_ptr))
-            argv[argc++] = token;
+  /* Push null sentinel (argv[argc]). */
+  *esp -= sizeof (char *);
+  *(char **)*esp = NULL;
 
-          /* Push argument strings onto the stack (right to left). */
-          int i;
-          char *argv_addrs[128];
-          for (i = argc - 1; i >= 0; i--)
-            {
-              size_t len = strlen (argv[i]) + 1;
-              *esp -= len;
-              memcpy (*esp, argv[i], len);
-              argv_addrs[i] = *esp;
-            }
+  /* Push argv[i] pointers (right to left). */
+  for (i = argc - 1; i >= 0; i--)
+    {
+      *esp -= sizeof (char *);
+      *(char **)*esp = argv_addrs[i];
+    }
 
-          /* Word-align. */
-          *esp = (void *)((uintptr_t) *esp & ~3);
+  /* Push argv (pointer to argv[0]). */
+  argv_start = *esp;
+  *esp -= sizeof (char **);
+  *(char ***)*esp = argv_start;
 
-          /* Push null sentinel (argv[argc]). */
-          *esp -= sizeof (char *);
-          *(char **)*esp = NULL;
+  /* Push argc. */
+  *esp -= sizeof (int);
+  *(int *)*esp = argc;
 
-          /* Push argv[i] pointers (right to left). */
-          for (i = argc - 1; i >= 0; i--)
-            {
-              *esp -= sizeof (char *);
-              *(char **)*esp = argv_addrs[i];
-            }
-
-          /* Push argv (pointer to argv[0]). */
-          char **argv_start = *esp;
-          *esp -= sizeof (char **);
-          *(char ***)*esp = argv_start;
-
-          /* Push argc. */
-          *esp -= sizeof (int);
-          *(int *)*esp = argc;
-
-          /* Push fake return address. */
-          *esp -= sizeof (void *);
-          *(void **)*esp = NULL;
+  /* Push fake return address. */
+  *esp -= sizeof (void *);
+  *(void **)*esp = NULL;
 
 #if 0
-          /* Print the stack. Make sure to keep this DISABLED during tests. */
-          hex_dump ((uintptr_t) *esp, *esp,
-                    (uintptr_t) PHYS_BASE - (uintptr_t) *esp, true);
+  /* Print the stack. Make sure to keep this DISABLED during tests. */
+  hex_dump ((uintptr_t) *esp, *esp,
+            (uintptr_t) PHYS_BASE - (uintptr_t) *esp, true);
 #endif
 
-          palloc_free_page (cmd_copy);
-          frame_unpin (kpage);
-        }
-      else
-        frame_free (kpage);
-    }
-cleanup:
-  if (!success)
-    {
-      struct sup_page_entry *spe =
-        sup_page_table_lookup (&thread_current ()->spt, upage);
-      if (spe != NULL)
-        sup_page_table_remove (&thread_current ()->spt, spe);
-    }
-  return success;
+  palloc_free_page (cmd_copy);
+  return true;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel

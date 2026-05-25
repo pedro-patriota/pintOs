@@ -17,13 +17,16 @@
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
+#ifdef VM
 #include "vm/page.h"
 #include "vm/swap.h"
 #include "vm/frame.h"
+#endif
 #include "../lib/user/syscall.h"
 
 static struct lock filesys_lock;
 
+#ifdef VM
 struct mmap_region
   {
     int mapid;
@@ -32,14 +35,17 @@ struct mmap_region
     struct file *file;
     struct list_elem elem;
   };
+#endif
 
 static void syscall_handler (struct intr_frame *);
 static void validate_user_address (const uint8_t *);
 static void validate_user_buffer (const void *, unsigned);
 static void validate_user_writable_address (const uint8_t *);
 static void validate_user_writable_buffer (void *, unsigned);
+#ifdef VM
 static bool ensure_user_page (const uint8_t *);
 static bool should_grow_stack_from_syscall (const void *);
+#endif
 static uint8_t get_user_byte (const uint8_t *);
 static uint32_t get_user_word (const void *);
 static void copy_in (void *, const void *, size_t);
@@ -58,6 +64,7 @@ syscall_filesys_lock_acquire (void)
 void
 syscall_do_munmap_all (void)
 {
+#ifdef VM
   struct thread *cur = thread_current ();
   struct list_elem *e;
 
@@ -103,6 +110,7 @@ syscall_do_munmap_all (void)
       list_remove (&m->elem);
       free (m);
     }
+#endif
 }
 
 void
@@ -122,11 +130,17 @@ static void
 validate_user_address (const uint8_t *uaddr)
 {
   struct thread *cur = thread_current ();
+  bool valid;
 
-  if (uaddr == NULL
-      || !is_user_vaddr (uaddr)
-      || cur->pagedir == NULL
-      || !ensure_user_page (uaddr))
+  if (uaddr == NULL || !is_user_vaddr (uaddr) || cur->pagedir == NULL)
+    process_exit_with_status (-1);
+
+#ifdef VM
+  valid = ensure_user_page (uaddr);
+#else
+  valid = pagedir_get_page (cur->pagedir, uaddr) != NULL;
+#endif
+  if (!valid)
     process_exit_with_status (-1);
 }
 
@@ -164,6 +178,7 @@ validate_user_writable_buffer (void *uaddr_, unsigned size)
     validate_user_writable_address (uaddr + i);
 }
 
+#ifdef VM
 static bool
 ensure_user_page (const uint8_t *uaddr)
 {
@@ -193,16 +208,13 @@ ensure_user_page (const uint8_t *uaddr)
 static bool
 should_grow_stack_from_syscall (const void *uaddr)
 {
-#ifdef VM
   void *esp = thread_current ()->user_esp;
   return esp != NULL
          && (uint8_t *) uaddr >= (uint8_t *) PHYS_BASE - STACK_MAX_SIZE
          && (uint8_t *) esp - 32 <= (uint8_t *) uaddr
          && uaddr < PHYS_BASE;
-#else
-  return false;
-#endif
 }
+#endif
 
 static uint8_t
 get_user_byte (const uint8_t *uaddr)
@@ -589,6 +601,7 @@ syscall_handler (struct intr_frame *f)
       close_fd ((int) get_user_word (esp + 1));
       break;
 
+#ifdef VM
     case SYS_MMAP:
       {
         int fd = (int) get_user_word (esp + 1);
@@ -766,6 +779,7 @@ syscall_handler (struct intr_frame *f)
           }
         break;
       }
+#endif
 
     default:
       process_exit_with_status (-1);
