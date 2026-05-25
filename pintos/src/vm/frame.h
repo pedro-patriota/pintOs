@@ -4,6 +4,7 @@
 void frame_table_init (void);
 
 void *frame_alloc (void *user_vaddr);
+void frame_unpin (void *kernel_vaddr);
 void frame_free (void *kernel_vaddr);
 
 #endif /* vm/frame.h */

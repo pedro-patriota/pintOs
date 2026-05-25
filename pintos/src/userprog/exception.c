@@ -18,7 +18,8 @@ static long long page_fault_cnt;
 static void kill (struct intr_frame *);
 static void page_fault (struct intr_frame *);
 #ifdef VM
-static bool handle_page_fault (void *fault_addr, struct intr_frame *f);
+static bool handle_page_fault (void *fault_addr, struct intr_frame *f,
+                               bool not_present);
 static bool should_grow_stack (void *fault_addr, void *esp);
 #endif
 
@@ -157,7 +158,7 @@ page_fault (struct intr_frame *f)
   user = (f->error_code & PF_U) != 0;
 
 #ifdef VM
-  if (handle_page_fault (fault_addr, f))
+  if (handle_page_fault (fault_addr, f, not_present))
     return;
 #endif
 
@@ -177,13 +178,13 @@ page_fault (struct intr_frame *f)
 
 #ifdef VM
 static bool
-handle_page_fault (void *fault_addr, struct intr_frame *f)
+handle_page_fault (void *fault_addr, struct intr_frame *f, bool not_present)
 {
   struct thread *t = thread_current ();
   void *user_vaddr = pg_round_down (fault_addr);
   struct sup_page_entry *spe = NULL;
 
-  if (fault_addr >= PHYS_BASE)
+  if (!not_present || fault_addr >= PHYS_BASE)
     return false;
 
   spe = sup_page_table_lookup(&t->spt, user_vaddr);
@@ -193,12 +194,9 @@ handle_page_fault (void *fault_addr, struct intr_frame *f)
       if (!should_grow_stack(fault_addr, f->esp))
         return false;
 
-      spe = calloc(1, sizeof (struct sup_page_entry));
-
-      spe->user_vaddr = user_vaddr;
-      spe->flags |= SUP_PAGE_WRITABLE;
-
-      sup_page_table_insert(&t->spt, spe);
+      if (!sup_page_table_add_anon (&t->spt, user_vaddr, true))
+        return false;
+      spe = sup_page_table_lookup (&t->spt, user_vaddr);
     }
 
   return load_page(spe);
@@ -207,6 +205,8 @@ handle_page_fault (void *fault_addr, struct intr_frame *f)
 static bool
 should_grow_stack (void *fault_addr, void *esp)
 {
-  return (uint8_t *)esp - 32 <= (uint8_t *)fault_addr && fault_addr < PHYS_BASE;
+  return (uint8_t *)fault_addr >= (uint8_t *) PHYS_BASE - STACK_MAX_SIZE
+         && (uint8_t *)esp - 32 <= (uint8_t *)fault_addr
+         && fault_addr < PHYS_BASE;
 }
 #endif

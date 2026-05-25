@@ -19,6 +19,10 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#ifdef VM
+#include "vm/frame.h"
+#include "vm/page.h"
+#endif
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -153,6 +157,7 @@ start_process (void *file_name_)
   sup_page_table_init (&thread_current ()->spt);
   list_init (&thread_current ()->mmap_list);
   thread_current ()->next_mapid = 1;
+  thread_current ()->user_esp = NULL;
 #endif
 
   thread_current ()->child_record = child;
@@ -262,6 +267,7 @@ process_exit (void)
 #ifdef VM
   /* Unmap any remaining memory-mapped files. */
   syscall_do_munmap_all ();
+  sup_page_table_destroy (&cur->spt);
 #endif
 
   /* Destroy the current process's page directory and switch back
@@ -592,7 +598,6 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
-  file_seek (file, ofs);
   while (read_bytes > 0 || zero_bytes > 0)
     {
       /* Calculate how to fill this page.
@@ -601,30 +606,16 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-      /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
+      if (!sup_page_table_add_file (&thread_current ()->spt, upage, file, ofs,
+                                    page_read_bytes, page_zero_bytes, writable,
+                                    SUP_PAGE_FILE))
         return false;
-
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false;
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
-
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable))
-        {
-          palloc_free_page (kpage);
-          return false;
-        }
 
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
       upage += PGSIZE;
+      ofs += PGSIZE;
     }
   return true;
 }
@@ -636,12 +627,17 @@ static bool
 setup_stack (void **esp, const char *cmd_line)
 {
   uint8_t *kpage;
+  void *upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
   bool success = false;
 
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+  if (!sup_page_table_add_anon (&thread_current ()->spt, upage, true))
+    return false;
+
+  kpage = frame_alloc (upage);
   if (kpage != NULL)
     {
-      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
+      memset (kpage, 0, PGSIZE);
+      success = install_page (upage, kpage, true);
       if (success)
         {
           *esp = PHYS_BASE;
@@ -652,7 +648,12 @@ setup_stack (void **esp, const char *cmd_line)
           char *argv[128];
           char *cmd_copy = palloc_get_page (0);
           if (cmd_copy == NULL)
-            return false;
+            {
+              pagedir_clear_page (thread_current ()->pagedir, upage);
+              frame_free (kpage);
+              success = false;
+              goto cleanup;
+            }
           strlcpy (cmd_copy, cmd_line, PGSIZE);
 
           for (token = strtok_r (cmd_copy, " ", &save_ptr); token != NULL;
@@ -704,9 +705,18 @@ setup_stack (void **esp, const char *cmd_line)
 #endif
 
           palloc_free_page (cmd_copy);
+          frame_unpin (kpage);
         }
       else
-        palloc_free_page (kpage);
+        frame_free (kpage);
+    }
+cleanup:
+  if (!success)
+    {
+      struct sup_page_entry *spe =
+        sup_page_table_lookup (&thread_current ()->spt, upage);
+      if (spe != NULL)
+        sup_page_table_remove (&thread_current ()->spt, spe);
     }
   return success;
 }

@@ -1,11 +1,16 @@
 #include "vm/page.h"
 #include <debug.h>
+#include <stdlib.h>
+#include <string.h>
+#include "threads/malloc.h"
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "vm/frame.h"
+#include "vm/swap.h"
 #ifdef USERPROG
 #include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #endif
 
 static bool
@@ -49,6 +54,96 @@ sup_page_table_init (struct sup_page_table *spt)
 {
   hash_init (&spt->table, sup_page_table_hash_func, sup_page_table_less_func,
              NULL);
+}
+
+static void
+sup_page_table_destroy_entry (struct hash_elem *e, void *aux UNUSED)
+{
+  struct sup_page_entry *spe = hash_entry (e, struct sup_page_entry, elem);
+
+#ifdef USERPROG
+  struct thread *cur = thread_current ();
+  if (cur->pagedir != NULL)
+    {
+      void *kernel_vaddr = pagedir_get_page (cur->pagedir, spe->user_vaddr);
+      if (kernel_vaddr != NULL)
+        {
+          pagedir_clear_page (cur->pagedir, spe->user_vaddr);
+          frame_free (pg_round_down (kernel_vaddr));
+        }
+    }
+#endif
+
+  if (spe->flags & SUP_PAGE_SWAPPED)
+    swap_free ((int) spe->swap_slot);
+  free (spe);
+}
+
+void
+sup_page_table_destroy (struct sup_page_table *spt)
+{
+  hash_destroy (&spt->table, sup_page_table_destroy_entry);
+}
+
+struct sup_page_entry *
+sup_page_create (void *user_vaddr, enum sup_page_type type, bool writable)
+{
+  struct sup_page_entry *spe;
+
+  ASSERT (pg_ofs (user_vaddr) == 0);
+
+  spe = calloc (1, sizeof *spe);
+  if (spe == NULL)
+    return NULL;
+
+  spe->user_vaddr = user_vaddr;
+  spe->type = type;
+  spe->swap_slot = (block_sector_t) -1;
+  if (writable)
+    spe->flags |= SUP_PAGE_WRITABLE;
+  return spe;
+}
+
+bool
+sup_page_table_add_file (struct sup_page_table *spt, void *user_vaddr,
+                         struct file *file, off_t offset, size_t read_bytes,
+                         size_t zero_bytes, bool writable,
+                         enum sup_page_type type)
+{
+  struct sup_page_entry *spe;
+
+  spe = sup_page_create (user_vaddr, type, writable);
+  if (spe == NULL)
+    return false;
+
+  spe->file = file;
+  spe->offset = offset;
+  spe->read_bytes = read_bytes;
+  spe->zero_bytes = zero_bytes;
+
+  if (!sup_page_table_insert (spt, spe))
+    {
+      free (spe);
+      return false;
+    }
+  return true;
+}
+
+bool
+sup_page_table_add_anon (struct sup_page_table *spt, void *user_vaddr,
+                         bool writable)
+{
+  struct sup_page_entry *spe = sup_page_create (user_vaddr, SUP_PAGE_ANON,
+                                                writable);
+  if (spe == NULL)
+    return false;
+
+  if (!sup_page_table_insert (spt, spe))
+    {
+      free (spe);
+      return false;
+    }
+  return true;
 }
 
 bool
@@ -103,12 +198,18 @@ load_page (struct sup_page_entry *spe)
     {
       swap_in ((int) spe->swap_slot, kernel_vaddr);
       spe->flags &= ~SUP_PAGE_SWAPPED;
+      spe->swap_slot = (block_sector_t) -1;
     }
   else if (spe->file != NULL)
     {
-      file_seek (spe->file, spe->offset);
-
-      file_size = (size_t)file_read (spe->file, kernel_vaddr, spe->read_bytes);
+#ifdef USERPROG
+      syscall_filesys_lock_acquire ();
+#endif
+      file_size = (size_t)file_read_at (spe->file, kernel_vaddr,
+                                        spe->read_bytes, spe->offset);
+#ifdef USERPROG
+      syscall_filesys_lock_release ();
+#endif
 
       if (file_size != spe->read_bytes)
         {
@@ -124,6 +225,8 @@ load_page (struct sup_page_entry *spe)
   if (!install_page (spe->user_vaddr, kernel_vaddr,
                      spe->flags & SUP_PAGE_WRITABLE))
     ok = false;
+  else
+    frame_unpin (kernel_vaddr);
 
 CLEANUP:
   if (!ok && kernel_vaddr != NULL)
