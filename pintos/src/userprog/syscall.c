@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <syscall-nr.h>
 #include "devices/input.h"
 #include "devices/shutdown.h"
@@ -15,8 +16,21 @@
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
+#include "vm/page.h"
+#include "vm/swap.h"
+#include "vm/frame.h"
+#include "../lib/user/syscall.h"
 
 static struct lock filesys_lock;
+
+struct mmap_region
+  {
+    int mapid;
+    void *addr;
+    size_t length;
+    struct file *file;
+    struct list_elem elem;
+  };
 
 static void syscall_handler (struct intr_frame *);
 static void validate_user_address (const uint8_t *);
@@ -36,6 +50,56 @@ void
 syscall_filesys_lock_acquire (void)
 {
   lock_acquire (&filesys_lock);
+}
+
+void
+syscall_do_munmap_all (void)
+{
+  struct thread *cur = thread_current ();
+  struct list_elem *e;
+
+  for (e = list_begin (&cur->mmap_list); e != list_end (&cur->mmap_list); )
+    {
+      struct mmap_region *m = list_entry (e, struct mmap_region, elem);
+      e = list_next (e);
+
+      size_t page_cnt = (m->length + PGSIZE - 1) / PGSIZE;
+      size_t i;
+      for (i = 0; i < page_cnt; i++)
+        {
+          void *uaddr = m->addr + i * PGSIZE;
+          struct sup_page_entry *spe = sup_page_table_lookup (&cur->spt, uaddr);
+          if (spe == NULL)
+            continue;
+
+          void *kpage = pagedir_get_page (cur->pagedir, uaddr);
+          if (kpage != NULL)
+            {
+              if (pagedir_is_dirty (cur->pagedir, uaddr) && spe->file != NULL)
+                {
+                  syscall_filesys_lock_acquire ();
+                  file_write_at (spe->file, kpage, spe->read_bytes, spe->offset);
+                  syscall_filesys_lock_release ();
+                }
+              pagedir_clear_page (cur->pagedir, uaddr);
+              frame_free (pg_round_down (kpage));
+            }
+          else if (spe->flags & SUP_PAGE_SWAPPED)
+            {
+              swap_free ((int) spe->swap_slot);
+            }
+
+          sup_page_table_remove (&cur->spt, spe);
+        }
+
+      syscall_filesys_lock_acquire ();
+      file_allow_write (m->file);
+      file_close (m->file);
+      syscall_filesys_lock_release ();
+
+      list_remove (&m->elem);
+      free (m);
+    }
 }
 
 void
@@ -478,6 +542,183 @@ syscall_handler (struct intr_frame *f)
     case SYS_CLOSE:
       close_fd ((int) get_user_word (esp + 1));
       break;
+
+    case SYS_MMAP:
+      {
+        int fd = (int) get_user_word (esp + 1);
+        void *addr = (void *) get_user_word (esp + 2);
+        struct thread *cur = thread_current ();
+
+        if (addr == NULL || pg_ofs (addr) != 0 || !is_user_vaddr (addr))
+          {
+            f->eax = MAP_FAILED;
+            break;
+          }
+
+        struct file *file = get_file_from_fd (fd);
+        if (file == NULL)
+          {
+            f->eax = MAP_FAILED;
+            break;
+          }
+
+        syscall_filesys_lock_acquire ();
+        struct file *rfile = file_reopen (file);
+        if (rfile == NULL)
+          {
+            syscall_filesys_lock_release ();
+            f->eax = MAP_FAILED;
+            break;
+          }
+        off_t length = file_length (rfile);
+        if (length <= 0)
+          {
+            file_close (rfile);
+            syscall_filesys_lock_release ();
+            f->eax = MAP_FAILED;
+            break;
+          }
+        syscall_filesys_lock_release ();
+
+        size_t page_cnt = (length + PGSIZE - 1) / PGSIZE;
+
+        /* Check for overlap with existing mappings or pages. */
+        size_t i;
+        bool bad = false;
+        for (i = 0; i < page_cnt; i++)
+          {
+            void *uaddr = addr + i * PGSIZE;
+            if (!is_user_vaddr (uaddr) || pagedir_get_page (cur->pagedir, uaddr) != NULL ||
+                sup_page_table_lookup (&cur->spt, uaddr) != NULL)
+              {
+                bad = true;
+                break;
+              }
+          }
+        if (bad)
+          {
+            file_close (rfile);
+            f->eax = MAP_FAILED;
+            break;
+          }
+
+        /* Create mmap region record. */
+        struct mmap_region *m = malloc (sizeof *m);
+
+        if (m == NULL)
+          {
+            file_close (rfile);
+            f->eax = MAP_FAILED;
+            break;
+          }
+
+        m->addr = addr;
+        m->length = length;
+        m->file = rfile;
+        m->mapid = cur->next_mapid++;
+
+        list_push_back (&cur->mmap_list, &m->elem);
+
+        /* Insert supplemental page entries for the mapping. */
+        for (i = 0; i < page_cnt; i++)
+          {
+            struct sup_page_entry *spe = malloc (sizeof *spe);
+            if (spe == NULL)
+              break;
+            spe->user_vaddr = addr + i * PGSIZE;
+            spe->access_time = 0;
+            spe->flags = SUP_PAGE_WRITABLE;
+            spe->file = m->file;
+            spe->offset = i * PGSIZE;
+            spe->read_bytes = (size_t) (length > (off_t) (i * PGSIZE) ?
+                                        (size_t) (length - (off_t) (i * PGSIZE)) : 0);
+            if (spe->read_bytes > PGSIZE)
+              spe->read_bytes = PGSIZE;
+            spe->zero_bytes = PGSIZE - spe->read_bytes;
+            spe->swap_slot = 0;
+
+            if (!sup_page_table_insert (&cur->spt, spe))
+              {
+                free (spe);
+                break;
+              }
+          }
+
+        /* If we failed to insert for some page, roll back. */
+        if (i < page_cnt)
+          {
+            /* remove inserted entries */
+            size_t j;
+            for (j = 0; j < i; j++)
+              {
+                struct sup_page_entry *spe = sup_page_table_lookup (&cur->spt, addr + j * PGSIZE);
+                if (spe != NULL)
+                  sup_page_table_remove (&cur->spt, spe);
+              }
+            list_remove (&m->elem);
+            file_close (m->file);
+            free (m);
+            f->eax = MAP_FAILED;
+            break;
+          }
+
+        f->eax = m->mapid;
+        break;
+      }
+
+    case SYS_MUNMAP:
+      {
+        int mapid = (int) get_user_word (esp + 1);
+        struct thread *cur = thread_current ();
+
+        struct list_elem *e;
+        for (e = list_begin (&cur->mmap_list); e != list_end (&cur->mmap_list); )
+          {
+            struct mmap_region *m = list_entry (e, struct mmap_region, elem);
+            e = list_next (e);
+            if (m->mapid == mapid)
+              {
+                size_t page_cnt = (m->length + PGSIZE - 1) / PGSIZE;
+                size_t i;
+                for (i = 0; i < page_cnt; i++)
+                  {
+                    void *uaddr = m->addr + i * PGSIZE;
+                    struct sup_page_entry *spe = sup_page_table_lookup (&cur->spt, uaddr);
+                    if (spe == NULL)
+                      continue;
+
+                    void *kpage = pagedir_get_page (cur->pagedir, uaddr);
+                    if (kpage != NULL)
+                      {
+                        if (pagedir_is_dirty (cur->pagedir, uaddr) && spe->file != NULL)
+                          {
+                            syscall_filesys_lock_acquire ();
+                            file_write_at (spe->file, kpage, spe->read_bytes, spe->offset);
+                            syscall_filesys_lock_release ();
+                          }
+                        pagedir_clear_page (cur->pagedir, uaddr);
+                        frame_free (pg_round_down (kpage));
+                      }
+                    else if (spe->flags & SUP_PAGE_SWAPPED)
+                      {
+                        swap_free ((int) spe->swap_slot);
+                      }
+
+                    sup_page_table_remove (&cur->spt, spe);
+                  }
+
+                syscall_filesys_lock_acquire ();
+                file_allow_write (m->file);
+                file_close (m->file);
+                syscall_filesys_lock_release ();
+
+                list_remove (&m->elem);
+                free (m);
+                break;
+              }
+          }
+        break;
+      }
 
     default:
       process_exit_with_status (-1);

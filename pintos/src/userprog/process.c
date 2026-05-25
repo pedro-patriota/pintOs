@@ -151,6 +151,8 @@ start_process (void *file_name_)
 
 #ifdef VM
   sup_page_table_init (&thread_current ()->spt);
+  list_init (&thread_current ()->mmap_list);
+  thread_current ()->next_mapid = 1;
 #endif
 
   thread_current ()->child_record = child;
@@ -256,6 +258,11 @@ process_exit (void)
       child_record_release (cur->child_record);
       cur->child_record = NULL;
     }
+
+#ifdef VM
+  /* Unmap any remaining memory-mapped files. */
+  syscall_do_munmap_all ();
+#endif
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */

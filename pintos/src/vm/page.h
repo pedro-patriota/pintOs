@@ -2,6 +2,7 @@
 #define VM_PAGE_H
 
 #include <hash.h>
+#include "devices/block.h"
 #include "filesys/file.h"
 
 enum sup_page_flags
@@ -10,6 +11,7 @@ enum sup_page_flags
     SUP_PAGE_DIRTY    = 1 << 0,
     SUP_PAGE_ACCESSED = 1 << 1,
     SUP_PAGE_WRITABLE = 1 << 2,
+    SUP_PAGE_SWAPPED  = 1 << 3,
   };
 
 struct sup_page_entry
@@ -26,6 +28,8 @@ struct sup_page_entry
     off_t offset;
     size_t read_bytes;
     size_t zero_bytes;
+
+    block_sector_t swap_slot;
   };
 
 struct sup_page_table

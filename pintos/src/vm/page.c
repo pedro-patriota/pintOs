@@ -99,8 +99,12 @@ load_page (struct sup_page_entry *spe)
       ok = false;
       goto CLEANUP;
     }
-
-  if (spe->file != NULL)
+  if (spe->flags & SUP_PAGE_SWAPPED)
+    {
+      swap_in ((int) spe->swap_slot, kernel_vaddr);
+      spe->flags &= ~SUP_PAGE_SWAPPED;
+    }
+  else if (spe->file != NULL)
     {
       file_seek (spe->file, spe->offset);
 
