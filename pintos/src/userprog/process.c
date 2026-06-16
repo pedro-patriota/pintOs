@@ -163,6 +163,9 @@ start_process (void *file_name_)
   thread_current ()->child_record = child;
   free (args);
 
+  /* Initialize current working directory to root. */
+  thread_current ()->cwd = ROOT_DIR_SECTOR;
+
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;

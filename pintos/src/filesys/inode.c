@@ -16,8 +16,9 @@ struct inode_disk
   {
     block_sector_t start;               /* First data sector. */
     off_t length;                       /* File size in bytes. */
+    int flags;                          /* Flags. */
     unsigned magic;                     /* Magic number. */
-    uint32_t unused[125];               /* Not used. */
+    uint32_t unused[124];               /* Not used. */
   };
 
 /* Returns the number of sectors to allocate for an inode SIZE
@@ -70,7 +71,7 @@ inode_init (void)
    Returns true if successful.
    Returns false if memory or disk allocation fails. */
 bool
-inode_create (block_sector_t sector, off_t length)
+inode_create (block_sector_t sector, off_t length, int flags)
 {
   struct inode_disk *disk_inode = NULL;
   bool success = false;
@@ -86,6 +87,7 @@ inode_create (block_sector_t sector, off_t length)
     {
       size_t sectors = bytes_to_sectors (length);
       disk_inode->length = length;
+      disk_inode->flags = flags;
       disk_inode->magic = INODE_MAGIC;
       if (free_map_allocate (sectors, &disk_inode->start)) 
         {
@@ -103,6 +105,13 @@ inode_create (block_sector_t sector, off_t length)
       free (disk_inode);
     }
   return success;
+}
+
+bool
+inode_is_dir (const struct inode *inode)
+{
+  ASSERT (inode != NULL);
+  return !!(inode->data.flags & INODE_FLAGS_IS_DIR);
 }
 
 /* Reads an inode from SECTOR
@@ -258,12 +267,55 @@ off_t
 inode_write_at (struct inode *inode, const void *buffer_, off_t size,
                 off_t offset) 
 {
+  static char buf[BLOCK_SECTOR_SIZE] = {0};
   const uint8_t *buffer = buffer_;
   off_t bytes_written = 0;
   uint8_t *bounce = NULL;
+  off_t new_length = 0;
+  size_t old_sectors = 0;
+  size_t new_sectors = 0;
+  block_sector_t new_start = 0;
 
   if (inode->deny_write_cnt)
     return 0;
+
+  /* If writing past end of file, grow the inode (allocate more sectors).
+     This implementation allocates a new contiguous region large enough to
+     hold the extended file, copies existing data to the new region, frees
+     the old region, and updates the on-disk inode. */
+  if (size > 0 && offset + size > inode->data.length)
+    {
+      new_length = offset + size;
+      old_sectors = bytes_to_sectors (inode->data.length);
+      new_sectors = bytes_to_sectors (new_length);
+
+      if (new_sectors > old_sectors)
+        {
+          /* Try to allocate a contiguous range for the whole new size. */
+          if (!free_map_allocate (new_sectors, &new_start))
+            return 0;
+
+          /* Copy existing data to new location, if any. */
+          for (size_t i = 0; i < old_sectors; i++)
+            {
+              block_read (fs_device, inode->data.start + i, buf);
+              block_write (fs_device, new_start + i, buf);
+            }
+
+          /* Zero any newly allocated sectors beyond the old size. */
+          memset (buf, 0, sizeof buf);
+          for (size_t i = old_sectors; i < new_sectors; i++)
+            block_write (fs_device, new_start + i, buf);
+
+          /* Release old blocks (if any) and update inode start. */
+          if (old_sectors > 0)
+            free_map_release (inode->data.start, old_sectors);
+          inode->data.start = new_start;
+        }
+
+      inode->data.length = new_length;
+      block_write (fs_device, inode->sector, &inode->data);
+    }
 
   while (size > 0) 
     {

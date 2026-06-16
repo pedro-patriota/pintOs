@@ -4,11 +4,14 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <syscall-nr.h>
 #include "devices/input.h"
 #include "devices/shutdown.h"
+#include "filesys/directory.h"
 #include "filesys/file.h"
 #include "filesys/filesys.h"
+#include "filesys/inode.h"
 #include "threads/interrupt.h"
 #include "threads/malloc.h"
 #include "threads/palloc.h"
@@ -400,6 +403,22 @@ syscall_handler (struct intr_frame *f)
         f->eax = ok;
         break;
       }
+    case SYS_MKDIR:
+      {
+        const char *udir = (const char *) get_user_word (esp + 1);
+        char *dir = copy_in_string (udir);
+        bool ok = false;
+
+        if (dir != NULL)
+          {
+            syscall_filesys_lock_acquire ();
+            ok = filesys_mkdir (dir);
+            syscall_filesys_lock_release ();
+            palloc_free_page (dir);
+          }
+        f->eax = ok;
+        break;
+      }
 
     case SYS_OPEN:
       {
@@ -423,6 +442,35 @@ syscall_handler (struct intr_frame *f)
             palloc_free_page (file_name);
           }
         f->eax = fd;
+        break;
+      }
+
+    case SYS_CHDIR:
+      {
+        const char *udir = (const char *) get_user_word (esp + 1);
+        char *dir = copy_in_string (udir);
+        struct file *fobj = NULL;
+        struct inode *inode = NULL;
+        bool ok = false;
+
+        if (dir != NULL)
+          {
+            syscall_filesys_lock_acquire ();
+            fobj = filesys_open (dir);
+            if (fobj != NULL)
+              {
+                inode = file_get_inode (fobj);
+                if (inode_is_dir (inode))
+                  {
+                    thread_current ()->cwd = inode_get_inumber (inode);
+                    ok = true;
+                  }
+                file_close (fobj);
+              }
+            syscall_filesys_lock_release ();
+            palloc_free_page (dir);
+          }
+        f->eax = ok;
         break;
       }
 
@@ -470,7 +518,7 @@ syscall_handler (struct intr_frame *f)
           {
             struct file *file = get_file_from_fd (fd);
 
-            if (file == NULL)
+            if (file == NULL || inode_is_dir (file_get_inode (file)))
               {
                 f->eax = -1;
                 break;
@@ -600,6 +648,68 @@ syscall_handler (struct intr_frame *f)
     case SYS_CLOSE:
       close_fd ((int) get_user_word (esp + 1));
       break;
+
+    case SYS_READDIR:
+      {
+        char local_name[READDIR_MAX_LEN + 1] = {0};
+        int fd = (int) get_user_word (esp + 1);
+        char *name = (char *) get_user_word (esp + 2);
+        struct file *file = NULL;
+        struct dir *d = NULL;
+        bool ok = false;
+
+        if (name == NULL)
+          {
+            f->eax = false;
+            break;
+          }
+        validate_user_writable_buffer (name, READDIR_MAX_LEN + 1);
+
+        file = get_file_from_fd (fd);
+        if (file == NULL || !inode_is_dir (file_get_inode (file)))
+          {
+            f->eax = false;
+            break;
+          }
+
+        /* Create a dir wrapper around the file's inode and sync positions. */
+        d = dir_open (inode_reopen (file_get_inode (file)));
+        if (d == NULL)
+          {
+            f->eax = false;
+            break;
+          }
+        dir_set_pos (d, file_tell (file));
+        ok = dir_readdir (d, local_name);
+        if (ok)
+          copy_out (name, local_name, strnlen (local_name, READDIR_MAX_LEN) + 1);
+        file_seek (file, dir_get_pos (d));
+        dir_close (d);
+        f->eax = ok;
+        break;
+      }
+
+    case SYS_ISDIR:
+      {
+        int fd = (int) get_user_word (esp + 1);
+        struct file *file = get_file_from_fd (fd);
+        bool isdir = false;
+        if (file != NULL)
+          isdir = inode_is_dir (file_get_inode (file));
+        f->eax = isdir;
+        break;
+      }
+
+    case SYS_INUMBER:
+      {
+        int fd = (int) get_user_word (esp + 1);
+        struct file *file = get_file_from_fd (fd);
+        int inum = -1;
+        if (file != NULL)
+          inum = (int) inode_get_inumber (file_get_inode (file));
+        f->eax = inum;
+        break;
+      }
 
 #ifdef VM
     case SYS_MMAP:

@@ -5,6 +5,7 @@
 #include <list.h>
 #include <stdint.h>
 #ifdef USERPROG
+#include "devices/block.h"
 #include "threads/synch.h"
 #endif
 #ifdef VM
@@ -134,6 +135,7 @@ struct thread
     struct file *fd_table[MAX_FD];      /* Open files by descriptor. */
     int next_fd;                        /* Next descriptor search point. */
     struct file *executable;            /* Running executable. */
+    block_sector_t cwd;                 /* Current working directory (inode sector). */
 #endif
 
 #ifdef VM

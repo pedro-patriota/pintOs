@@ -5,6 +5,7 @@
 #include "filesys/filesys.h"
 #include "filesys/inode.h"
 #include "threads/malloc.h"
+#include "threads/thread.h"
 
 /* A directory. */
 struct dir 
@@ -26,7 +27,8 @@ struct dir_entry
 bool
 dir_create (block_sector_t sector, size_t entry_cnt)
 {
-  return inode_create (sector, entry_cnt * sizeof (struct dir_entry));
+  return inode_create (sector, entry_cnt * sizeof (struct dir_entry),
+                       INODE_FLAGS_IS_DIR);
 }
 
 /* Opens and returns the directory for the given INODE, of which
@@ -184,9 +186,12 @@ dir_add (struct dir *dir, const char *name, block_sector_t inode_sector)
 bool
 dir_remove (struct dir *dir, const char *name) 
 {
+  static char entry_name[NAME_MAX + 1] = {0};
   struct dir_entry e;
+  struct dir *target = NULL;
   struct inode *inode = NULL;
   bool success = false;
+  bool is_empty = true;
   off_t ofs;
 
   ASSERT (dir != NULL);
@@ -200,6 +205,38 @@ dir_remove (struct dir *dir, const char *name)
   inode = inode_open (e.inode_sector);
   if (inode == NULL)
     goto done;
+
+  /* If it's a directory, ensure it's not root, not current working
+     directory, and it's empty (only "." and ".." entries). */
+  if (inode_is_dir (inode))
+    {
+      /* Don't remove root. */
+      if (inode_get_inumber (inode) == ROOT_DIR_SECTOR)
+        goto done;
+
+      /* Don't remove if it's the cwd of the current thread. */
+      if (thread_current () != NULL &&
+          thread_current ()->cwd == inode_get_inumber (inode))
+        goto done;
+
+      /* Check directory emptiness. */
+      target = dir_open (inode_reopen (inode));
+      if (target == NULL)
+        goto done;
+
+      while (dir_readdir (target, entry_name))
+        {
+          if (strcmp (entry_name, ".") != 0 &&
+              strcmp (entry_name, "..") != 0)
+            {
+              is_empty = false;
+              break;
+            }
+        }
+      dir_close (target);
+      if (!is_empty)
+        goto done;
+    }
 
   /* Erase directory entry. */
   e.in_use = false;
@@ -228,9 +265,24 @@ dir_readdir (struct dir *dir, char name[NAME_MAX + 1])
       dir->pos += sizeof e;
       if (e.in_use)
         {
+          /* Skip "." and ".." entries. */
+          if (strcmp (e.name, ".") == 0 || strcmp (e.name, "..") == 0)
+            continue;
           strlcpy (name, e.name, NAME_MAX + 1);
           return true;
-        } 
+        }
     }
   return false;
+}
+
+off_t
+dir_get_pos (struct dir *dir)
+{
+  return dir->pos;
+}
+
+void
+dir_set_pos (struct dir *dir, off_t pos)
+{
+  dir->pos = pos;
 }
