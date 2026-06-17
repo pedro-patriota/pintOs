@@ -1,6 +1,7 @@
 #include "filesys/filesys.h"
 #include <debug.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "filesys/file.h"
 #include "filesys/free-map.h"
@@ -8,7 +9,6 @@
 #include "filesys/directory.h"
 #include "threads/thread.h"
 #include "threads/malloc.h"
-#include <stdlib.h>
 
 /* Partition that contains the file system. */
 struct block *fs_device;
@@ -29,6 +29,16 @@ dir_open_from_sector (block_sector_t sector)
 static struct inode *
 path_lookup (const char *path)
 {
+  struct dir *dir = NULL;
+  struct dir *next_dir = NULL;
+  struct inode *inode = NULL;
+  struct thread *t = thread_current ();
+  block_sector_t cwd = ROOT_DIR_SECTOR;
+  char *saveptr = NULL;
+  char *token = NULL;
+  char *next_token = NULL;
+  char *path_copy = NULL;
+
   if (path == NULL)
     return NULL;
 
@@ -40,23 +50,16 @@ path_lookup (const char *path)
   if (path[0] == '/' && path[1] == '\0')
     return inode_open (ROOT_DIR_SECTOR);
 
-  char *copy = malloc (strlen (path) + 1);
-  if (copy == NULL)
+  path_copy = malloc (strlen (path) + 1);
+  if (path_copy == NULL)
     return NULL;
-  strlcpy (copy, path, strlen (path) + 1);
-
-  struct dir *dir = NULL;
-  struct inode *inode = NULL;
-  char *saveptr = NULL;
-  char *token = NULL;
+  strlcpy (path_copy, path, strlen (path) + 1);
 
   /* Start at root for absolute paths, or at thread cwd for relative. */
   if (path[0] == '/')
     dir = dir_open_root ();
   else
     {
-      block_sector_t cwd = ROOT_DIR_SECTOR;
-      struct thread *t = thread_current ();
       if (t != NULL)
         cwd = t->cwd ? t->cwd : ROOT_DIR_SECTOR;
       dir = dir_open_from_sector (cwd);
@@ -64,121 +67,123 @@ path_lookup (const char *path)
 
   if (dir == NULL)
     {
-      free (copy);
+      free (path_copy);
       return NULL;
     }
 
-  token = strtok_r (copy, "/", &saveptr);
+  token = strtok_r (path_copy, "/", &saveptr);
   if (token == NULL)
     {
       /* Path was "/"; return root inode. */
       inode = inode_reopen (dir_get_inode (dir));
       dir_close (dir);
-      free (copy);
+      free (path_copy);
       return inode;
     }
 
   for (;;)
     {
-      char *next = strtok_r (NULL, "/", &saveptr);
+      next_token = strtok_r (NULL, "/", &saveptr);
 
       if (strcmp (token, ".") == 0)
         {
           /* Stay in current dir. If this is the last component, return it. */
-          if (next == NULL)
+          if (next_token == NULL)
             {
               inode = inode_reopen (dir_get_inode (dir));
               dir_close (dir);
-              free (copy);
+              free (path_copy);
               return inode;
             }
         }
       else if (strcmp (token, "..") == 0)
         {
           /* Move to parent. If this is the last component, return parent inode. */
-          struct inode *p_inode = NULL;
-          if (!dir_lookup (dir, "..", &p_inode) || p_inode == NULL)
+          if (!dir_lookup (dir, "..", &inode) || inode == NULL)
             {
               dir_close (dir);
-              free (copy);
+              free (path_copy);
               return NULL;
             }
-          if (next == NULL)
+          if (next_token == NULL)
             {
               dir_close (dir);
-              free (copy);
-              return p_inode;
+              free (path_copy);
+              return inode;
             }
-          struct dir *p_dir = dir_open (p_inode);
+          next_dir = dir_open (inode);
           dir_close (dir);
-          dir = p_dir;
+          dir = next_dir;
         }
       else
         {
-          struct inode *next_inode = NULL;
-          if (!dir_lookup (dir, token, &next_inode) || next_inode == NULL)
+          if (!dir_lookup (dir, token, &inode) || inode == NULL)
             {
               dir_close (dir);
-              free (copy);
+              free (path_copy);
               return NULL;
             }
-          if (next == NULL)
+          if (next_token == NULL)
             {
               /* Last component: return this inode. */
               dir_close (dir);
-              free (copy);
-              return next_inode;
+              free (path_copy);
+              return inode;
             }
           /* Not last: must be a directory. */
-          if (!inode_is_dir (next_inode))
+          if (!inode_is_dir (inode))
             {
-              inode_close (next_inode);
+              inode_close (inode);
               dir_close (dir);
-              free (copy);
+              free (path_copy);
               return NULL;
             }
           /* Descend into next directory. */
-          struct dir *next_dir = dir_open (next_inode);
+          next_dir = dir_open (inode);
           dir_close (dir);
           dir = next_dir;
         }
 
-      if (next == NULL)
+      if (next_token == NULL)
         break;
-      token = next;
+      token = next_token;
     }
 
   /* Should not reach here. */
   dir_close (dir);
-  free (copy);
+  free (path_copy);
   return NULL;
 }
 
-/* Helper: Given a path, return the parent directory (opened) and copy the
+/* Given a path, return the parent directory (opened) and copy the
    final path component into NAME. Caller must close parent_dir. Returns
    true on success. */
 static bool
 get_parent_dir (const char *path, struct dir **parent_dir, char name[NAME_MAX + 1])
 {
+  struct dir *dir = NULL;
+  struct dir *next_dir = NULL;
+  struct inode *inode = NULL;
+  block_sector_t cwd = ROOT_DIR_SECTOR;
+  struct thread *t = thread_current ();
+  char *saveptr = NULL;
+  char *token = NULL;
+  char *next_token = NULL;
+  char *path_copy = NULL;
+
   if (path == NULL || parent_dir == NULL || name == NULL)
     return false;
 
-  char *copy = malloc (strlen (path) + 1);
-  if (copy == NULL)
+  path_copy = malloc (strlen (path) + 1);
+  if (path_copy == NULL)
     return false;
-  strlcpy (copy, path, strlen (path) + 1);
-
-  struct dir *dir = NULL;
-  char *saveptr = NULL;
-  char *token = NULL;
+  strlcpy (path_copy, path, strlen (path) + 1);
 
   /* Start at root for absolute paths, or at thread cwd for relative. */
   if (path[0] == '/')
     dir = dir_open_root ();
   else
     {
-      block_sector_t cwd = ROOT_DIR_SECTOR;
-      struct thread *t = thread_current ();
       if (t != NULL)
         cwd = t->cwd ? t->cwd : ROOT_DIR_SECTOR;
       dir = dir_open_from_sector (cwd);
@@ -186,79 +191,76 @@ get_parent_dir (const char *path, struct dir **parent_dir, char name[NAME_MAX + 
 
   if (dir == NULL)
     {
-      free (copy);
+      free (path_copy);
       return false;
     }
 
-  token = strtok_r (copy, "/", &saveptr);
+  token = strtok_r (path_copy, "/", &saveptr);
   if (token == NULL)
     {
       /* Path is "/" - parent is root, name is empty. */
       *parent_dir = dir;
       name[0] = '\0';
-      free (copy);
+      free (path_copy);
       return true;
     }
 
-  char *next = NULL;
   for (;;)
     {
-      next = strtok_r (NULL, "/", &saveptr);
-      if (next == NULL)
+      next_token = strtok_r (NULL, "/", &saveptr);
+      if (next_token == NULL)
         {
-          /* token is the final component */
+          /* Token is the final component */
           if (strlen (token) > NAME_MAX)
             {
               dir_close (dir);
-              free (copy);
+              free (path_copy);
               return false;
             }
           strlcpy (name, token, NAME_MAX + 1);
           *parent_dir = dir;
-          free (copy);
+          free (path_copy);
           return true;
         }
 
       /* Intermediate component: descend into directory. */
       if (strcmp (token, ".") == 0)
         {
-          /* stay */
+          /* Stay */
         }
       else if (strcmp (token, "..") == 0)
         {
-          struct inode *p_inode = NULL;
-          if (!dir_lookup (dir, "..", &p_inode) || p_inode == NULL)
+          if (!dir_lookup (dir, "..", &inode) || inode == NULL)
             {
               dir_close (dir);
-              free (copy);
+              free (path_copy);
               return false;
             }
-          struct dir *p_dir = dir_open (p_inode);
+          next_dir = dir_open (inode);
           dir_close (dir);
-          dir = p_dir;
+          dir = next_dir;
         }
       else
         {
-          struct inode *next_inode = NULL;
-          if (!dir_lookup (dir, token, &next_inode) || next_inode == NULL)
+          if (!dir_lookup (dir, token, &inode) || inode == NULL)
             {
               dir_close (dir);
-              free (copy);
+              free (path_copy);
               return false;
             }
-          if (!inode_is_dir (next_inode))
+          if (!inode_is_dir (inode))
             {
-              inode_close (next_inode);
+              inode_close (inode);
               dir_close (dir);
-              free (copy);
+              free (path_copy);
               return false;
             }
-          struct dir *next_dir = dir_open (next_inode);
+          next_dir = dir_open (inode);
           dir_close (dir);
           dir = next_dir;
         }
 
-      token = next;
+      token = next_token;
     }
 }
 
