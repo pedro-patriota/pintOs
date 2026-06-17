@@ -10,19 +10,23 @@
 #include "filesys/file.h"
 #include "filesys/filesys.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
 #include "threads/palloc.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
+#ifdef VM
 #include "vm/page.h"
 #include "vm/swap.h"
 #include "vm/frame.h"
+#endif
 #include "../lib/user/syscall.h"
 
 static struct lock filesys_lock;
 
+#ifdef VM
 struct mmap_region
   {
     int mapid;
@@ -31,12 +35,17 @@ struct mmap_region
     struct file *file;
     struct list_elem elem;
   };
+#endif
 
 static void syscall_handler (struct intr_frame *);
 static void validate_user_address (const uint8_t *);
 static void validate_user_buffer (const void *, unsigned);
 static void validate_user_writable_address (const uint8_t *);
 static void validate_user_writable_buffer (void *, unsigned);
+#ifdef VM
+static bool ensure_user_page (const uint8_t *);
+static bool should_grow_stack_from_syscall (const void *);
+#endif
 static uint8_t get_user_byte (const uint8_t *);
 static uint32_t get_user_word (const void *);
 static void copy_in (void *, const void *, size_t);
@@ -55,6 +64,7 @@ syscall_filesys_lock_acquire (void)
 void
 syscall_do_munmap_all (void)
 {
+#ifdef VM
   struct thread *cur = thread_current ();
   struct list_elem *e;
 
@@ -100,6 +110,7 @@ syscall_do_munmap_all (void)
       list_remove (&m->elem);
       free (m);
     }
+#endif
 }
 
 void
@@ -119,11 +130,17 @@ static void
 validate_user_address (const uint8_t *uaddr)
 {
   struct thread *cur = thread_current ();
+  bool valid;
 
-  if (uaddr == NULL
-      || !is_user_vaddr (uaddr)
-      || cur->pagedir == NULL
-      || pagedir_get_page (cur->pagedir, uaddr) == NULL)
+  if (uaddr == NULL || !is_user_vaddr (uaddr) || cur->pagedir == NULL)
+    process_exit_with_status (-1);
+
+#ifdef VM
+  valid = ensure_user_page (uaddr);
+#else
+  valid = pagedir_get_page (cur->pagedir, uaddr) != NULL;
+#endif
+  if (!valid)
     process_exit_with_status (-1);
 }
 
@@ -160,6 +177,44 @@ validate_user_writable_buffer (void *uaddr_, unsigned size)
   for (i = 0; i < size; i++)
     validate_user_writable_address (uaddr + i);
 }
+
+#ifdef VM
+static bool
+ensure_user_page (const uint8_t *uaddr)
+{
+  struct thread *cur = thread_current ();
+
+  if (pagedir_get_page (cur->pagedir, uaddr) != NULL)
+    return true;
+
+#ifdef VM
+  void *upage = pg_round_down (uaddr);
+  struct sup_page_entry *spe = sup_page_table_lookup (&cur->spt, upage);
+
+  if (spe == NULL && should_grow_stack_from_syscall (uaddr))
+    {
+      if (!sup_page_table_add_anon (&cur->spt, upage, true))
+        return false;
+      spe = sup_page_table_lookup (&cur->spt, upage);
+    }
+
+  if (spe != NULL && load_page (spe))
+    return pagedir_get_page (cur->pagedir, uaddr) != NULL;
+#endif
+
+  return false;
+}
+
+static bool
+should_grow_stack_from_syscall (const void *uaddr)
+{
+  void *esp = thread_current ()->user_esp;
+  return esp != NULL
+         && (uint8_t *) uaddr >= (uint8_t *) PHYS_BASE - STACK_MAX_SIZE
+         && (uint8_t *) esp - 32 <= (uint8_t *) uaddr
+         && uaddr < PHYS_BASE;
+}
+#endif
 
 static uint8_t
 get_user_byte (const uint8_t *uaddr)
@@ -277,6 +332,9 @@ static void
 syscall_handler (struct intr_frame *f)
 {
   uint32_t *esp = (uint32_t *) f->esp;
+#ifdef VM
+  thread_current ()->user_esp = f->esp;
+#endif
   int syscall_num = (int) get_user_word (esp);
 
   switch (syscall_num)
@@ -543,6 +601,7 @@ syscall_handler (struct intr_frame *f)
       close_fd ((int) get_user_word (esp + 1));
       break;
 
+#ifdef VM
     case SYS_MMAP:
       {
         int fd = (int) get_user_word (esp + 1);
@@ -627,6 +686,7 @@ syscall_handler (struct intr_frame *f)
               break;
             spe->user_vaddr = addr + i * PGSIZE;
             spe->access_time = 0;
+            spe->type = SUP_PAGE_MMAP;
             spe->flags = SUP_PAGE_WRITABLE;
             spe->file = m->file;
             spe->offset = i * PGSIZE;
@@ -635,7 +695,7 @@ syscall_handler (struct intr_frame *f)
             if (spe->read_bytes > PGSIZE)
               spe->read_bytes = PGSIZE;
             spe->zero_bytes = PGSIZE - spe->read_bytes;
-            spe->swap_slot = 0;
+            spe->swap_slot = (block_sector_t) -1;
 
             if (!sup_page_table_insert (&cur->spt, spe))
               {
@@ -719,6 +779,7 @@ syscall_handler (struct intr_frame *f)
           }
         break;
       }
+#endif
 
     default:
       process_exit_with_status (-1);

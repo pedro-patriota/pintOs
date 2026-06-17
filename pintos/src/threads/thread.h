@@ -141,6 +141,7 @@ struct thread
 
     struct list mmap_list;              /* List of mmap regions. */
     int next_mapid;                     /* Next map id to allocate. */
+    void *user_esp;                     /* Last user stack pointer seen. */
 #endif
 
     /* Owned by thread.c. */

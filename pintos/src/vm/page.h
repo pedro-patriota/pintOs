@@ -5,6 +5,15 @@
 #include "devices/block.h"
 #include "filesys/file.h"
 
+#define STACK_MAX_SIZE (128 * 1024 * 1024)
+
+enum sup_page_type
+  {
+    SUP_PAGE_ANON,
+    SUP_PAGE_FILE,
+    SUP_PAGE_MMAP
+  };
+
 enum sup_page_flags
   {
     SUP_PAGE_NONE     = 0,
@@ -20,6 +29,7 @@ struct sup_page_entry
 
     int64_t access_time;
 
+    enum sup_page_type type;
     int flags;
 
     struct hash_elem elem;
@@ -38,10 +48,19 @@ struct sup_page_table
   };
 
 void sup_page_table_init (struct sup_page_table *);
+void sup_page_table_destroy (struct sup_page_table *);
 bool sup_page_table_insert (struct sup_page_table *, struct sup_page_entry *);
 void sup_page_table_remove (struct sup_page_table *, struct sup_page_entry *);
 struct sup_page_entry *sup_page_table_lookup (struct sup_page_table *, void *user_vaddr);
 
+struct sup_page_entry *sup_page_create (void *user_vaddr,
+                                        enum sup_page_type type,
+                                        bool writable);
+bool sup_page_table_add_file (struct sup_page_table *, void *user_vaddr,
+                              struct file *, off_t, size_t, size_t,
+                              bool, enum sup_page_type);
+bool sup_page_table_add_anon (struct sup_page_table *, void *user_vaddr,
+                              bool writable);
 bool load_page(struct sup_page_entry *);
 
 #endif /* vm/page.h */
