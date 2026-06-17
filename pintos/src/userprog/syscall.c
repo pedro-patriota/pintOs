@@ -451,6 +451,7 @@ syscall_handler (struct intr_frame *f)
         char *dir = copy_in_string (udir);
         struct file *fobj = NULL;
         struct inode *inode = NULL;
+        struct dir *new_cwd = NULL;
         bool ok = false;
 
         if (dir != NULL)
@@ -462,8 +463,14 @@ syscall_handler (struct intr_frame *f)
                 inode = file_get_inode (fobj);
                 if (inode_is_dir (inode))
                   {
-                    thread_current ()->cwd = inode_get_inumber (inode);
-                    ok = true;
+                    new_cwd = dir_open (inode_reopen (inode));
+                    if (new_cwd != NULL)
+                      {
+                        if (thread_current ()->cwd != NULL)
+                          dir_close (thread_current ()->cwd);
+                        thread_current ()->cwd = new_cwd;
+                        ok = true;
+                      }
                   }
                 file_close (fobj);
               }
@@ -583,7 +590,7 @@ syscall_handler (struct intr_frame *f)
           {
             struct file *file = get_file_from_fd (fd);
 
-            if (file == NULL)
+            if (file == NULL || inode_is_dir (file_get_inode (file)))
               {
                 f->eax = -1;
                 break;
@@ -672,19 +679,22 @@ syscall_handler (struct intr_frame *f)
             break;
           }
 
+        syscall_filesys_lock_acquire ();
         /* Create a dir wrapper around the file's inode and sync positions. */
         d = dir_open (inode_reopen (file_get_inode (file)));
         if (d == NULL)
           {
+            syscall_filesys_lock_release ();
             f->eax = false;
             break;
           }
         dir_set_pos (d, file_tell (file));
         ok = dir_readdir (d, local_name);
-        if (ok)
-          copy_out (name, local_name, strnlen (local_name, READDIR_MAX_LEN) + 1);
         file_seek (file, dir_get_pos (d));
         dir_close (d);
+        syscall_filesys_lock_release ();
+        if (ok)
+          copy_out (name, local_name, strnlen (local_name, READDIR_MAX_LEN) + 1);
         f->eax = ok;
         break;
       }
@@ -695,7 +705,11 @@ syscall_handler (struct intr_frame *f)
         struct file *file = get_file_from_fd (fd);
         bool isdir = false;
         if (file != NULL)
-          isdir = inode_is_dir (file_get_inode (file));
+          {
+            syscall_filesys_lock_acquire ();
+            isdir = inode_is_dir (file_get_inode (file));
+            syscall_filesys_lock_release ();
+          }
         f->eax = isdir;
         break;
       }
@@ -706,7 +720,11 @@ syscall_handler (struct intr_frame *f)
         struct file *file = get_file_from_fd (fd);
         int inum = -1;
         if (file != NULL)
-          inum = (int) inode_get_inumber (file_get_inode (file));
+          {
+            syscall_filesys_lock_acquire ();
+            inum = (int) inode_get_inumber (file_get_inode (file));
+            syscall_filesys_lock_release ();
+          }
         f->eax = inum;
         break;
       }
@@ -725,7 +743,7 @@ syscall_handler (struct intr_frame *f)
           }
 
         struct file *file = get_file_from_fd (fd);
-        if (file == NULL)
+        if (file == NULL || inode_is_dir (file_get_inode (file)))
           {
             f->eax = MAP_FAILED;
             break;

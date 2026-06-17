@@ -34,6 +34,7 @@ typedef int tid_t;
 /* Forward declaration to avoid circular dependency with synch.h. */
 struct lock;
 struct file;
+struct dir;
 
 #ifdef USERPROG
 #define MAX_FD 128
@@ -135,7 +136,7 @@ struct thread
     struct file *fd_table[MAX_FD];      /* Open files by descriptor. */
     int next_fd;                        /* Next descriptor search point. */
     struct file *executable;            /* Running executable. */
-    block_sector_t cwd;                 /* Current working directory (inode sector). */
+    struct dir *cwd;                    /* Current working directory. */
 #endif
 
 #ifdef VM

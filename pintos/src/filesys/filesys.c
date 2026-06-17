@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "filesys/cache.h"
 #include "filesys/file.h"
 #include "filesys/free-map.h"
 #include "filesys/inode.h"
@@ -16,14 +17,7 @@ struct block *fs_device;
 static void do_format (void);
 
 /* Opens a directory given its sector. */
-static struct dir *
-dir_open_from_sector (block_sector_t sector)
-{
-  struct inode *inode = inode_open (sector);
-  if (inode == NULL)
-    return NULL;
-  return dir_open (inode);
-}
+static struct dir *open_start_dir (const char *);
 
 /* Lookup the inode for the given path. */
 static struct inode *
@@ -32,8 +26,6 @@ path_lookup (const char *path)
   struct dir *dir = NULL;
   struct dir *next_dir = NULL;
   struct inode *inode = NULL;
-  struct thread *t = thread_current ();
-  block_sector_t cwd = ROOT_DIR_SECTOR;
   char *saveptr = NULL;
   char *token = NULL;
   char *next_token = NULL;
@@ -55,15 +47,7 @@ path_lookup (const char *path)
     return NULL;
   strlcpy (path_copy, path, strlen (path) + 1);
 
-  /* Start at root for absolute paths, or at thread cwd for relative. */
-  if (path[0] == '/')
-    dir = dir_open_root ();
-  else
-    {
-      if (t != NULL)
-        cwd = t->cwd ? t->cwd : ROOT_DIR_SECTOR;
-      dir = dir_open_from_sector (cwd);
-    }
+  dir = open_start_dir (path);
 
   if (dir == NULL)
     {
@@ -112,6 +96,12 @@ path_lookup (const char *path)
               return inode;
             }
           next_dir = dir_open (inode);
+          if (next_dir == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return NULL;
+            }
           dir_close (dir);
           dir = next_dir;
         }
@@ -140,6 +130,12 @@ path_lookup (const char *path)
             }
           /* Descend into next directory. */
           next_dir = dir_open (inode);
+          if (next_dir == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return NULL;
+            }
           dir_close (dir);
           dir = next_dir;
         }
@@ -164,8 +160,6 @@ get_parent_dir (const char *path, struct dir **parent_dir, char name[NAME_MAX + 
   struct dir *dir = NULL;
   struct dir *next_dir = NULL;
   struct inode *inode = NULL;
-  block_sector_t cwd = ROOT_DIR_SECTOR;
-  struct thread *t = thread_current ();
   char *saveptr = NULL;
   char *token = NULL;
   char *next_token = NULL;
@@ -179,15 +173,7 @@ get_parent_dir (const char *path, struct dir **parent_dir, char name[NAME_MAX + 
     return false;
   strlcpy (path_copy, path, strlen (path) + 1);
 
-  /* Start at root for absolute paths, or at thread cwd for relative. */
-  if (path[0] == '/')
-    dir = dir_open_root ();
-  else
-    {
-      if (t != NULL)
-        cwd = t->cwd ? t->cwd : ROOT_DIR_SECTOR;
-      dir = dir_open_from_sector (cwd);
-    }
+  dir = open_start_dir (path);
 
   if (dir == NULL)
     {
@@ -237,6 +223,12 @@ get_parent_dir (const char *path, struct dir **parent_dir, char name[NAME_MAX + 
               return false;
             }
           next_dir = dir_open (inode);
+          if (next_dir == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return false;
+            }
           dir_close (dir);
           dir = next_dir;
         }
@@ -256,12 +248,32 @@ get_parent_dir (const char *path, struct dir **parent_dir, char name[NAME_MAX + 
               return false;
             }
           next_dir = dir_open (inode);
+          if (next_dir == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return false;
+            }
           dir_close (dir);
           dir = next_dir;
         }
 
       token = next_token;
     }
+}
+
+static struct dir *
+open_start_dir (const char *path)
+{
+  struct thread *t = thread_current ();
+
+  if (path[0] == '/')
+    return dir_open_root ();
+
+  if (t != NULL && t->cwd != NULL)
+    return dir_reopen (t->cwd);
+
+  return dir_open_root ();
 }
 
 /* Initializes the file system module.
@@ -273,6 +285,7 @@ filesys_init (bool format)
   if (fs_device == NULL)
     PANIC ("No file system device found, can't initialize file system.");
 
+  cache_init ();
   inode_init ();
   free_map_init ();
 
@@ -288,6 +301,7 @@ void
 filesys_done (void) 
 {
   free_map_close ();
+  cache_done ();
 }
 
 /* Creates a file named NAME with the given INITIAL_SIZE.
@@ -359,7 +373,7 @@ filesys_remove (const char *name)
 bool
 filesys_mkdir (const char *name)
 {
-  static char final_name[NAME_MAX + 1] = {0};
+  char final_name[NAME_MAX + 1] = {0};
   struct dir *parent = NULL;
   bool success = false;
 
@@ -397,7 +411,6 @@ filesys_mkdir (const char *name)
     struct dir *newdir = dir_open (inode_open (inode_sector));
     if (newdir != NULL)
       {
-        struct inode *n_inode = dir_get_inode (newdir);
         dir_add (newdir, ".", inode_sector);
         dir_add (newdir, "..", inode_get_inumber (dir_get_inode (parent)));
         dir_close (newdir);

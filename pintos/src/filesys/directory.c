@@ -5,7 +5,6 @@
 #include "filesys/filesys.h"
 #include "filesys/inode.h"
 #include "threads/malloc.h"
-#include "threads/thread.h"
 
 /* A directory. */
 struct dir 
@@ -186,7 +185,7 @@ dir_add (struct dir *dir, const char *name, block_sector_t inode_sector)
 bool
 dir_remove (struct dir *dir, const char *name) 
 {
-  static char entry_name[NAME_MAX + 1] = {0};
+  char entry_name[NAME_MAX + 1] = {0};
   struct dir_entry e;
   struct dir *target = NULL;
   struct inode *inode = NULL;
@@ -197,6 +196,9 @@ dir_remove (struct dir *dir, const char *name)
   ASSERT (dir != NULL);
   ASSERT (name != NULL);
 
+  if (!strcmp (name, ".") || !strcmp (name, ".."))
+    goto done;
+
   /* Find directory entry. */
   if (!lookup (dir, name, &e, &ofs))
     goto done;
@@ -206,17 +208,16 @@ dir_remove (struct dir *dir, const char *name)
   if (inode == NULL)
     goto done;
 
-  /* If it's a directory, ensure it's not root, not current working
-     directory, and it's empty (only "." and ".." entries). */
+  /* If it's a directory, ensure it's not root, not open elsewhere,
+     and empty (only "." and ".." entries). */
   if (inode_is_dir (inode))
     {
       /* Don't remove root. */
       if (inode_get_inumber (inode) == ROOT_DIR_SECTOR)
         goto done;
 
-      /* Don't remove if it's the cwd of the current thread. */
-      if (thread_current () != NULL &&
-          thread_current ()->cwd == inode_get_inumber (inode))
+      /* The temporary inode_open() above accounts for one opener. */
+      if (inode_open_count (inode) > 1)
         goto done;
 
       /* Check directory emptiness. */
