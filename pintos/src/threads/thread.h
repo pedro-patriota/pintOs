@@ -4,6 +4,12 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#ifdef USERPROG
+#include "threads/synch.h"
+#endif
+#ifdef VM
+#include "vm/page.h"
+#endif
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -26,6 +32,23 @@ typedef int tid_t;
 
 /* Forward declaration to avoid circular dependency with synch.h. */
 struct lock;
+struct file;
+
+#ifdef USERPROG
+#define MAX_FD 128
+
+struct child_process
+  {
+    tid_t tid;
+    int exit_status;
+    bool load_success;
+    bool waited;
+    int ref_cnt;
+    struct semaphore load_sema;
+    struct semaphore exit_sema;
+    struct list_elem elem;
+  };
+#endif
 
 /* A kernel thread or user process.
 
@@ -90,7 +113,7 @@ struct thread
     enum thread_status status;          /* Thread state. */
     char name[16];                      /* Name (for debugging purposes). */
     uint8_t *stack;                     /* Saved stack pointer. */
-    int priority;                       
+    int priority;
     int base_priority;   /*guarda a prioridade real da thread e direciona a thread*/
     struct list locks_held;          /*lista de todos os locks que a thread segura no momento e percorrida pra saber se algum lock tem waiter de prioridade*/
     struct lock *waiting_on_lock; /*ponteiro para lock que a thread está esperando*/
@@ -105,6 +128,20 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    struct list children;               /* Child process records. */
+    struct child_process *child_record; /* Record shared with parent. */
+    int exit_status;                    /* Status reported to parent. */
+    struct file *fd_table[MAX_FD];      /* Open files by descriptor. */
+    int next_fd;                        /* Next descriptor search point. */
+    struct file *executable;            /* Running executable. */
+#endif
+
+#ifdef VM
+    struct sup_page_table spt;
+
+    struct list mmap_list;              /* List of mmap regions. */
+    int next_mapid;                     /* Next map id to allocate. */
+    void *user_esp;                     /* Last user stack pointer seen. */
 #endif
 
     /* Owned by thread.c. */
@@ -136,6 +173,7 @@ tid_t thread_tid (void);
 const char *thread_name (void);
 
 void thread_exit (void) NO_RETURN;
+void thread_exit_verbose (int exit_status) NO_RETURN;
 void thread_yield (void);
 
 /* Performs some operation on thread t, given auxiliary data AUX. */
