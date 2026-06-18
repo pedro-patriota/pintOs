@@ -1,16 +1,280 @@
 #include "filesys/filesys.h"
 #include <debug.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include "filesys/cache.h"
 #include "filesys/file.h"
 #include "filesys/free-map.h"
 #include "filesys/inode.h"
 #include "filesys/directory.h"
+#include "threads/thread.h"
+#include "threads/malloc.h"
 
 /* Partition that contains the file system. */
 struct block *fs_device;
 
 static void do_format (void);
+
+/* Opens a directory given its sector. */
+static struct dir *open_start_dir (const char *);
+
+/* Lookup the inode for the given path. */
+static struct inode *
+path_lookup (const char *path)
+{
+  struct dir *dir = NULL;
+  struct dir *next_dir = NULL;
+  struct inode *inode = NULL;
+  char *saveptr = NULL;
+  char *token = NULL;
+  char *next_token = NULL;
+  char *path_copy = NULL;
+
+  if (path == NULL)
+    return NULL;
+
+  /* Empty string is invalid. */
+  if (path[0] == '\0')
+    return NULL;
+
+  /* Special case: root. */
+  if (path[0] == '/' && path[1] == '\0')
+    return inode_open (ROOT_DIR_SECTOR);
+
+  path_copy = malloc (strlen (path) + 1);
+  if (path_copy == NULL)
+    return NULL;
+  strlcpy (path_copy, path, strlen (path) + 1);
+
+  dir = open_start_dir (path);
+
+  if (dir == NULL)
+    {
+      free (path_copy);
+      return NULL;
+    }
+
+  token = strtok_r (path_copy, "/", &saveptr);
+  if (token == NULL)
+    {
+      /* Path was "/"; return root inode. */
+      inode = inode_reopen (dir_get_inode (dir));
+      dir_close (dir);
+      free (path_copy);
+      return inode;
+    }
+
+  for (;;)
+    {
+      next_token = strtok_r (NULL, "/", &saveptr);
+
+      if (strcmp (token, ".") == 0)
+        {
+          /* Stay in current dir. If this is the last component, return it. */
+          if (next_token == NULL)
+            {
+              inode = inode_reopen (dir_get_inode (dir));
+              dir_close (dir);
+              free (path_copy);
+              return inode;
+            }
+        }
+      else if (strcmp (token, "..") == 0)
+        {
+          /* Move to parent. If this is the last component, return parent inode. */
+          if (!dir_lookup (dir, "..", &inode) || inode == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return NULL;
+            }
+          if (next_token == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return inode;
+            }
+          next_dir = dir_open (inode);
+          if (next_dir == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return NULL;
+            }
+          dir_close (dir);
+          dir = next_dir;
+        }
+      else
+        {
+          if (!dir_lookup (dir, token, &inode) || inode == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return NULL;
+            }
+          if (next_token == NULL)
+            {
+              /* Last component: return this inode. */
+              dir_close (dir);
+              free (path_copy);
+              return inode;
+            }
+          /* Not last: must be a directory. */
+          if (!inode_is_dir (inode))
+            {
+              inode_close (inode);
+              dir_close (dir);
+              free (path_copy);
+              return NULL;
+            }
+          /* Descend into next directory. */
+          next_dir = dir_open (inode);
+          if (next_dir == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return NULL;
+            }
+          dir_close (dir);
+          dir = next_dir;
+        }
+
+      if (next_token == NULL)
+        break;
+      token = next_token;
+    }
+
+  /* Should not reach here. */
+  dir_close (dir);
+  free (path_copy);
+  return NULL;
+}
+
+/* Given a path, return the parent directory (opened) and copy the
+   final path component into NAME. Caller must close parent_dir. Returns
+   true on success. */
+static bool
+get_parent_dir (const char *path, struct dir **parent_dir, char name[NAME_MAX + 1])
+{
+  struct dir *dir = NULL;
+  struct dir *next_dir = NULL;
+  struct inode *inode = NULL;
+  char *saveptr = NULL;
+  char *token = NULL;
+  char *next_token = NULL;
+  char *path_copy = NULL;
+
+  if (path == NULL || parent_dir == NULL || name == NULL)
+    return false;
+
+  path_copy = malloc (strlen (path) + 1);
+  if (path_copy == NULL)
+    return false;
+  strlcpy (path_copy, path, strlen (path) + 1);
+
+  dir = open_start_dir (path);
+
+  if (dir == NULL)
+    {
+      free (path_copy);
+      return false;
+    }
+
+  token = strtok_r (path_copy, "/", &saveptr);
+  if (token == NULL)
+    {
+      /* Path is "/" - parent is root, name is empty. */
+      *parent_dir = dir;
+      name[0] = '\0';
+      free (path_copy);
+      return true;
+    }
+
+  for (;;)
+    {
+      next_token = strtok_r (NULL, "/", &saveptr);
+      if (next_token == NULL)
+        {
+          /* Token is the final component */
+          if (strlen (token) > NAME_MAX)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return false;
+            }
+          strlcpy (name, token, NAME_MAX + 1);
+          *parent_dir = dir;
+          free (path_copy);
+          return true;
+        }
+
+      /* Intermediate component: descend into directory. */
+      if (strcmp (token, ".") == 0)
+        {
+          /* Stay */
+        }
+      else if (strcmp (token, "..") == 0)
+        {
+          if (!dir_lookup (dir, "..", &inode) || inode == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return false;
+            }
+          next_dir = dir_open (inode);
+          if (next_dir == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return false;
+            }
+          dir_close (dir);
+          dir = next_dir;
+        }
+      else
+        {
+          if (!dir_lookup (dir, token, &inode) || inode == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return false;
+            }
+          if (!inode_is_dir (inode))
+            {
+              inode_close (inode);
+              dir_close (dir);
+              free (path_copy);
+              return false;
+            }
+          next_dir = dir_open (inode);
+          if (next_dir == NULL)
+            {
+              dir_close (dir);
+              free (path_copy);
+              return false;
+            }
+          dir_close (dir);
+          dir = next_dir;
+        }
+
+      token = next_token;
+    }
+}
+
+static struct dir *
+open_start_dir (const char *path)
+{
+  struct thread *t = thread_current ();
+
+  if (path[0] == '/')
+    return dir_open_root ();
+
+  if (t != NULL && t->cwd != NULL)
+    return dir_reopen (t->cwd);
+
+  return dir_open_root ();
+}
 
 /* Initializes the file system module.
    If FORMAT is true, reformats the file system. */
@@ -21,6 +285,7 @@ filesys_init (bool format)
   if (fs_device == NULL)
     PANIC ("No file system device found, can't initialize file system.");
 
+  cache_init ();
   inode_init ();
   free_map_init ();
 
@@ -36,6 +301,7 @@ void
 filesys_done (void) 
 {
   free_map_close ();
+  cache_done ();
 }
 
 /* Creates a file named NAME with the given INITIAL_SIZE.
@@ -45,16 +311,28 @@ filesys_done (void)
 bool
 filesys_create (const char *name, off_t initial_size) 
 {
+  /* Create file given a possibly-path name. */
+  struct dir *parent = NULL;
+  char final_name[NAME_MAX + 1];
+  bool success = false;
   block_sector_t inode_sector = 0;
-  struct dir *dir = dir_open_root ();
-  bool success = (dir != NULL
-                  && free_map_allocate (1, &inode_sector)
-                  && inode_create (inode_sector, initial_size)
-                  && dir_add (dir, name, inode_sector));
-  if (!success && inode_sector != 0) 
-    free_map_release (inode_sector, 1);
-  dir_close (dir);
 
+  /* Find parent directory and final component. */
+  if (!get_parent_dir (name, &parent, final_name))
+    return false;
+
+  if (parent != NULL)
+    {
+      if (free_map_allocate (1, &inode_sector))
+        {
+          if (inode_create (inode_sector, initial_size, INODE_FLAGS_NONE)
+              && dir_add (parent, final_name, inode_sector))
+            success = true;
+          if (!success)
+            free_map_release (inode_sector, 1);
+        }
+      dir_close (parent);
+    }
   return success;
 }
 
@@ -66,13 +344,8 @@ filesys_create (const char *name, off_t initial_size)
 struct file *
 filesys_open (const char *name)
 {
-  struct dir *dir = dir_open_root ();
-  struct inode *inode = NULL;
-
-  if (dir != NULL)
-    dir_lookup (dir, name, &inode);
-  dir_close (dir);
-
+  /* Open file or directory at path NAME. */
+  struct inode *inode = path_lookup (name);
   return file_open (inode);
 }
 
@@ -83,10 +356,69 @@ filesys_open (const char *name)
 bool
 filesys_remove (const char *name) 
 {
-  struct dir *dir = dir_open_root ();
-  bool success = dir != NULL && dir_remove (dir, name);
-  dir_close (dir); 
+  struct dir *parent = NULL;
+  char final_name[NAME_MAX + 1];
+  bool success = false;
 
+  if (!get_parent_dir (name, &parent, final_name))
+    return false;
+  if (parent != NULL)
+    {
+      success = dir_remove (parent, final_name);
+      dir_close (parent);
+    }
+  return success;
+}
+
+bool
+filesys_mkdir (const char *name)
+{
+  char final_name[NAME_MAX + 1] = {0};
+  struct dir *parent = NULL;
+  bool success = false;
+
+  if (!get_parent_dir (name, &parent, final_name))
+    return false;
+
+  if (parent == NULL)
+    return false;
+
+  /* Allocate inode sector for directory. */
+  block_sector_t inode_sector = 0;
+  if (!free_map_allocate (1, &inode_sector))
+    {
+      dir_close (parent);
+      return false;
+    }
+
+  if (!dir_create (inode_sector, 16))
+    {
+      free_map_release (inode_sector, 1);
+      dir_close (parent);
+      return false;
+    }
+
+  /* Add entry in parent directory. */
+  if (!dir_add (parent, final_name, inode_sector))
+    {
+      free_map_release (inode_sector, 1);
+      dir_close (parent);
+      return false;
+    }
+
+  /* Initialize '.' and '..' in new directory. */
+  {
+    struct dir *newdir = dir_open (inode_open (inode_sector));
+    if (newdir != NULL)
+      {
+        dir_add (newdir, ".", inode_sector);
+        dir_add (newdir, "..", inode_get_inumber (dir_get_inode (parent)));
+        dir_close (newdir);
+      }
+  }
+
+  dir_close (parent);
+  success = true;
   return success;
 }
 
@@ -98,6 +430,16 @@ do_format (void)
   free_map_create ();
   if (!dir_create (ROOT_DIR_SECTOR, 16))
     PANIC ("root directory creation failed");
+  /* Initialize root directory '.' and '..' entries. */
+  {
+    struct dir *root = dir_open_root ();
+    if (root != NULL)
+      {
+        dir_add (root, ".", ROOT_DIR_SECTOR);
+        dir_add (root, "..", ROOT_DIR_SECTOR);
+        dir_close (root);
+      }
+  }
   free_map_close ();
   printf ("done.\n");
 }

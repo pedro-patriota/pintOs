@@ -31,6 +31,7 @@ struct start_process_args
   {
     char *file_name;
     struct child_process *child;
+    struct dir *cwd;
   };
 
 static void child_record_release (struct child_process *child);
@@ -116,6 +117,19 @@ process_execute (const char *file_name)
     }
   args->file_name = fn_copy;
   args->child = child;
+  syscall_filesys_lock_acquire ();
+  args->cwd = thread_current ()->cwd != NULL
+              ? dir_reopen (thread_current ()->cwd)
+              : dir_open_root ();
+  syscall_filesys_lock_release ();
+  if (args->cwd == NULL)
+    {
+      free (child);
+      free (args);
+      palloc_free_page (prog_name_copy);
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
 
   list_push_back (&thread_current ()->children, &child->elem);
 
@@ -125,6 +139,9 @@ process_execute (const char *file_name)
   if (tid == TID_ERROR)
     {
       list_remove (&child->elem);
+      syscall_filesys_lock_acquire ();
+      dir_close (args->cwd);
+      syscall_filesys_lock_release ();
       free (child);
       free (args);
       palloc_free_page (fn_copy);
@@ -161,6 +178,7 @@ start_process (void *file_name_)
 #endif
 
   thread_current ()->child_record = child;
+  thread_current ()->cwd = args->cwd;
   free (args);
 
   /* Initialize interrupt frame and load executable. */
@@ -247,6 +265,11 @@ process_exit (void)
     {
       file_close (cur->executable);
       cur->executable = NULL;
+    }
+  if (cur->cwd != NULL)
+    {
+      dir_close (cur->cwd);
+      cur->cwd = NULL;
     }
   syscall_filesys_lock_release ();
 

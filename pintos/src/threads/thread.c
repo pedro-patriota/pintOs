@@ -123,12 +123,20 @@ thread_recalculate_priority (struct thread *t)
 continuaria rodando mesmo com uma thread de prioridade maior esperando na fila*/
 void thread_yield_if_needed (void)
 {
-  if (list_empty(&ready_list))
-    return;
+  enum intr_level old_level;
+  int next_priority = PRI_MIN - 1;
 
-  struct thread *next = list_entry(list_max (&ready_list, thread_priority_less, NULL), struct thread, elem);
+  old_level = intr_disable ();
+  if (!list_empty (&ready_list))
+    {
+      struct thread *next =
+        list_entry (list_max (&ready_list, thread_priority_less, NULL),
+                    struct thread, elem);
+      next_priority = next->priority;
+    }
+  intr_set_level (old_level);
 
-  if(next->priority > thread_current ()->priority)
+  if (next_priority > thread_current ()->priority)
     thread_yield (); // cede cpu para quem tem maior prioridade
 }
 
@@ -590,6 +598,7 @@ init_thread (struct thread *t, const char *name, int priority)
   t->exit_status = -1;
   t->next_fd = 2;
   t->executable = NULL;
+  t->cwd = NULL;
 #endif
   t->magic = THREAD_MAGIC;
 
